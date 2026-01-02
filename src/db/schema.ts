@@ -1,4 +1,5 @@
-import Database from 'better-sqlite3';
+import sqlite3 from 'sqlite3';
+import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 
@@ -11,13 +12,67 @@ export function ensureDataDir() {
   }
 }
 
-export function initDatabase(): Database.Database {
+export interface Database {
+  run: (sql: string, ...params: any[]) => Promise<{ lastID: number; changes: number }>;
+  get: <T = any>(sql: string, ...params: any[]) => Promise<T | undefined>;
+  all: <T = any>(sql: string, ...params: any[]) => Promise<T[]>;
+  exec: (sql: string) => Promise<void>;
+  close: () => Promise<void>;
+}
+
+function createDatabase(db: sqlite3.Database): Database {
+  return {
+    run: (sql: string, ...params: any[]) => {
+      return new Promise((resolve, reject) => {
+        db.run(sql, params, function(err) {
+          if (err) reject(err);
+          else resolve({ lastID: this.lastID, changes: this.changes });
+        });
+      });
+    },
+    get: <T = any>(sql: string, ...params: any[]): Promise<T | undefined> => {
+      return new Promise<T | undefined>((resolve, reject) => {
+        db.get(sql, params, (err, row) => {
+          if (err) reject(err);
+          else resolve((row as T) || undefined);
+        });
+      });
+    },
+    all: <T = any>(sql: string, ...params: any[]): Promise<T[]> => {
+      return new Promise<T[]>((resolve, reject) => {
+        db.all(sql, params, (err, rows) => {
+          if (err) reject(err);
+          else resolve((rows || []) as T[]);
+        });
+      });
+    },
+    exec: (sql: string) => {
+      return new Promise((resolve, reject) => {
+        db.exec(sql, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    },
+    close: () => {
+      return new Promise((resolve, reject) => {
+        db.close((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    }
+  };
+}
+
+export function initDatabase(): Database {
   ensureDataDir();
   
-  const db = new Database(DB_PATH);
+  const db = new sqlite3.Database(DB_PATH);
+  const dbAsync = createDatabase(db);
   
   // Enable foreign keys
-  db.pragma('foreign_keys = ON');
+  db.run('PRAGMA foreign_keys = ON');
   
   // Create businesses table
   db.exec(`
@@ -38,11 +93,9 @@ export function initDatabase(): Database.Database {
   `);
   
   // Add url column if it doesn't exist (migration)
-  try {
-    db.exec('ALTER TABLE businesses ADD COLUMN url TEXT');
-  } catch (e) {
+  db.run('ALTER TABLE businesses ADD COLUMN url TEXT', (err) => {
     // Column already exists, ignore
-  }
+  });
   
   // Create run_state table (single row)
   db.exec(`
@@ -54,13 +107,14 @@ export function initDatabase(): Database.Database {
     )
   `);
   
-  // Initialize run_state if empty
-  const existing = db.prepare('SELECT COUNT(*) as count FROM run_state').get() as { count: number };
-  if (existing.count === 0) {
-    db.prepare('INSERT INTO run_state (id) VALUES (1)').run();
-  }
+  // Initialize run_state if empty (synchronous check)
+  db.get('SELECT COUNT(*) as count FROM run_state', (err, row: any) => {
+    if (!err && row && row.count === 0) {
+      db.run('INSERT INTO run_state (id) VALUES (1)');
+    }
+  });
   
-  return db;
+  return dbAsync;
 }
 
 export type Business = {
@@ -68,6 +122,7 @@ export type Business = {
   canonicalBusinessKey: string;
   placeId: string | null;
   cid: string | null;
+  url: string;
   name: string | null;
   spreadsheetId: string | null;
   folderId: string | null;
@@ -83,4 +138,3 @@ export type RunState = {
   lastRunStatus: string | null;
   lastRunError: string | null;
 };
-

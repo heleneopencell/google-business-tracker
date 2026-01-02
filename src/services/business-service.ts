@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { Database } from '../db/schema';
 import { PlaywrightService } from './playwright';
 import { GoogleSheetsService } from './google-sheets';
 import { GoogleDriveService } from './google-drive';
@@ -11,14 +11,14 @@ import path from 'path';
 import fs from 'fs';
 
 export class BusinessService {
-  private db: Database.Database;
+  private db: Database;
   private playwright: PlaywrightService;
   private sheetsService: GoogleSheetsService;
   private driveService: GoogleDriveService;
   private authService: GoogleAuthService;
 
   constructor(
-    db: Database.Database,
+    db: Database,
     playwright: PlaywrightService,
     sheetsService: GoogleSheetsService,
     driveService: GoogleDriveService,
@@ -47,9 +47,10 @@ export class BusinessService {
     const canonicalBusinessKey = deriveCanonicalBusinessKey(normalizedUrl, placeId, cid);
 
     // Check if business already exists
-    const existing = this.db
-      .prepare('SELECT id FROM businesses WHERE canonicalBusinessKey = ?')
-      .get(canonicalBusinessKey) as { id: number } | undefined;
+    const existing = await this.db.get<{ id: number }>(
+      'SELECT id FROM businesses WHERE canonicalBusinessKey = ?',
+      canonicalBusinessKey
+    );
 
     if (existing) {
       return { id: existing.id, canonicalBusinessKey };
@@ -57,18 +58,20 @@ export class BusinessService {
 
     // Check for duplicate placeId or cid
     if (placeId) {
-      const dupPlaceId = this.db
-        .prepare('SELECT id FROM businesses WHERE placeId = ?')
-        .get(placeId) as { id: number } | undefined;
+      const dupPlaceId = await this.db.get<{ id: number }>(
+        'SELECT id FROM businesses WHERE placeId = ?',
+        placeId
+      );
       if (dupPlaceId) {
         throw new Error('Duplicate placeId');
       }
     }
 
     if (cid) {
-      const dupCid = this.db
-        .prepare('SELECT id FROM businesses WHERE cid = ?')
-        .get(cid) as { id: number } | undefined;
+      const dupCid = await this.db.get<{ id: number }>(
+        'SELECT id FROM businesses WHERE cid = ?',
+        cid
+      );
       if (dupCid) {
         throw new Error('Duplicate cid');
       }
@@ -98,14 +101,13 @@ export class BusinessService {
     }
 
     // Insert business
-    const result = this.db
-      .prepare(`
-        INSERT INTO businesses (canonicalBusinessKey, placeId, cid, url, name, spreadsheetId, folderId)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(canonicalBusinessKey, placeId, cid, normalizedUrl, extracted.name, spreadsheetId, folderId);
+    const result = await this.db.run(
+      `INSERT INTO businesses (canonicalBusinessKey, placeId, cid, url, name, spreadsheetId, folderId)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      canonicalBusinessKey, placeId, cid, normalizedUrl, extracted.name, spreadsheetId, folderId
+    );
 
-    const businessId = result.lastInsertRowid as number;
+    const businessId = result.lastID;
 
     // Create first snapshot
     if (spreadsheetId) {
@@ -115,9 +117,10 @@ export class BusinessService {
       // Update lastCheckedDate and lastCheckedAt
       const today = getDublinDate();
       const now = new Date().toISOString();
-      this.db
-        .prepare('UPDATE businesses SET lastCheckedDate = ?, lastCheckedAt = ? WHERE id = ?')
-        .run(today, now, businessId);
+      await this.db.run(
+        'UPDATE businesses SET lastCheckedDate = ?, lastCheckedAt = ? WHERE id = ?',
+        today, now, businessId
+      );
     }
 
     return { id: businessId, canonicalBusinessKey };
@@ -125,9 +128,10 @@ export class BusinessService {
 
   async runCheck(businessId: number): Promise<void> {
     // Get business
-    const business = this.db
-      .prepare('SELECT * FROM businesses WHERE id = ?')
-      .get(businessId) as any;
+    const business = await this.db.get<any>(
+      'SELECT * FROM businesses WHERE id = ?',
+      businessId
+    );
 
     if (!business) {
       throw new Error('Business not found');
@@ -209,9 +213,10 @@ export class BusinessService {
       const folderId = business.folderId || await this.driveService.createFolder(extracted.name || 'Unknown');
       const spreadsheetId = await this.sheetsService.createSpreadsheet(extracted.name || 'Unknown');
       
-      this.db
-        .prepare('UPDATE businesses SET spreadsheetId = ?, folderId = ? WHERE id = ?')
-        .run(spreadsheetId, folderId, businessId);
+      await this.db.run(
+        'UPDATE businesses SET spreadsheetId = ?, folderId = ? WHERE id = ?',
+        spreadsheetId, folderId, businessId
+      );
       
       business.spreadsheetId = spreadsheetId;
       business.folderId = folderId;
@@ -221,9 +226,10 @@ export class BusinessService {
 
     // Update lastCheckedDate and lastCheckedAt
     const now = new Date().toISOString();
-    this.db
-      .prepare('UPDATE businesses SET lastCheckedDate = ?, lastCheckedAt = ? WHERE id = ?')
-      .run(today, now, businessId);
+    await this.db.run(
+      'UPDATE businesses SET lastCheckedDate = ?, lastCheckedAt = ? WHERE id = ?',
+      today, now, businessId
+    );
   }
 
   private createSnapshot(
@@ -273,27 +279,11 @@ export class BusinessService {
     };
   }
 
-  private reconstructUrl(business: any): string | null {
-    // Try to reconstruct from canonicalBusinessKey
-    const key = business.canonicalBusinessKey;
-    if (key.startsWith('place_id:')) {
-      const placeId = key.replace('place_id:', '');
-      return `https://www.google.com/maps/place/?q=place_id:${placeId}`;
-    } else if (key.startsWith('cid:')) {
-      const cid = key.replace('cid:', '');
-      return `https://www.google.com/maps/search/?cid=${cid}`;
-    } else if (key.startsWith('url:')) {
-      return key.replace('url:', '');
-    }
-    return null;
+  async getAllBusinesses(): Promise<any[]> {
+    return await this.db.all('SELECT * FROM businesses ORDER BY createdAt DESC');
   }
 
-  getAllBusinesses(): any[] {
-    return this.db.prepare('SELECT * FROM businesses ORDER BY createdAt DESC').all();
-  }
-
-  getBusiness(id: number): any {
-    return this.db.prepare('SELECT * FROM businesses WHERE id = ?').get(id);
+  async getBusiness(id: number): Promise<any> {
+    return await this.db.get('SELECT * FROM businesses WHERE id = ?', id);
   }
 }
-

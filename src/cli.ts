@@ -37,7 +37,7 @@ async function runDailyCheck() {
       }
 
       // Get all businesses
-      const businesses = businessService.getAllBusinesses();
+      const businesses = await businessService.getAllBusinesses();
       
       let successCount = 0;
       let failureCount = 0;
@@ -59,22 +59,20 @@ async function runDailyCheck() {
       // Update run_state
       const now = new Date().toISOString();
       const status = failureCount === 0 ? 'SUCCESS' : 'PARTIAL';
-      db.prepare(`
-        UPDATE run_state 
-        SET lastRunAt = ?, lastRunStatus = ?, lastRunError = NULL
-        WHERE id = 1
-      `).run(now, status);
+      await db.run(
+        'UPDATE run_state SET lastRunAt = ?, lastRunStatus = ?, lastRunError = NULL WHERE id = 1',
+        now, status
+      );
 
       console.log(`Daily check completed: ${successCount} successful, ${failureCount} failed`);
     }, true); // Allow override of stale locks
   } catch (e: any) {
     // Update run_state with error
     const now = new Date().toISOString();
-    db.prepare(`
-      UPDATE run_state 
-      SET lastRunAt = ?, lastRunStatus = 'FAILED', lastRunError = ?
-      WHERE id = 1
-    `).run(now, e.message);
+    await db.run(
+      "UPDATE run_state SET lastRunAt = ?, lastRunStatus = 'FAILED', lastRunError = ? WHERE id = 1",
+      now, e.message
+    );
 
     console.error(`Daily check failed: ${e.message}`);
     process.exit(1);

@@ -143,7 +143,13 @@ export class PlaywrightService {
       }
 
       // Try accessibility snapshot first
-      const a11ySnapshot = await page.accessibility.snapshot();
+      let a11ySnapshot: any = null;
+      try {
+        // Playwright accessibility API
+        a11ySnapshot = await (page as any).accessibility?.snapshot();
+      } catch (e) {
+        // Accessibility not available, use DOM fallback
+      }
       
       // Fallback to DOM
       const extracted: ExtractedData = {
@@ -270,7 +276,7 @@ export class PlaywrightService {
     const phonePattern = /(\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/;
     const bodyText = await page.textContent('body').catch(() => '');
     const match = bodyText?.match(phonePattern);
-    if (match) {
+    if (match && match[0]) {
       return match[0].replace(/\D/g, '');
     }
 
@@ -371,20 +377,21 @@ export class PlaywrightService {
       await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
       
       // Find business overview panel
-      const panel = await page.locator('[data-value="Overview"], [role="main"]').first().waitFor({ timeout: 5000 }).catch(() => null);
+      const panelLocator = page.locator('[data-value="Overview"], [role="main"]').first();
+      const panelExists = await panelLocator.count() > 0;
       
-      if (!panel) {
+      if (!panelExists) {
         return false;
       }
 
       // Set width to 500px if needed
-      const box = await panel.boundingBox();
+      const box = await panelLocator.boundingBox();
       if (box) {
         await page.setViewportSize({ width: Math.max(500, box.width), height: box.height + 100 });
       }
 
       // Capture screenshot clipped to container
-      await panel.screenshot({ path: outputPath, type: 'png' });
+      await panelLocator.screenshot({ path: outputPath, type: 'png' });
       return true;
     } catch (e) {
       return false;

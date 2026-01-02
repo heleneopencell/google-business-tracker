@@ -27,7 +27,7 @@ export function createBusinessesRouter(businessService: BusinessService): Router
 
   router.get('/', async (req, res) => {
     try {
-      const businesses = businessService.getAllBusinesses();
+      const businesses = await businessService.getAllBusinesses();
       res.json(businesses);
     } catch (e) {
       res.status(500).json({ error: 'Failed to get businesses' });
@@ -37,7 +37,7 @@ export function createBusinessesRouter(businessService: BusinessService): Router
   router.get('/:id', async (req, res) => {
     try {
       const id = parseInt(req.params.id);
-      const business = businessService.getBusiness(id);
+      const business = await businessService.getBusiness(id);
       if (!business) {
         return res.status(404).json({ error: 'Business not found' });
       }
