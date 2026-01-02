@@ -34,6 +34,12 @@ function App() {
       const authData = await authRes.json();
       setLoggedIn(sessionData.loggedIn);
       setAuthenticated(authData.authenticated);
+      
+      // If logged in, show success message
+      if (sessionData.loggedIn && !loggedIn) {
+        setSuccess('Successfully logged in to Google Maps!');
+        setTimeout(() => setSuccess(null), 5000);
+      }
     } catch (e) {
       console.error('Failed to check status', e);
     }
@@ -50,14 +56,22 @@ function App() {
   };
 
   const handleOpenLogin = async () => {
+    if (loading) return; // Prevent multiple clicks
+    
     setLoading(true);
+    setError(null);
+    setSuccess(null);
     try {
       const res = await fetch('/api/session/open-login', { method: 'POST' });
       if (res.ok) {
-        setSuccess('Login page opened. Please complete login in the browser window.');
-        setTimeout(() => checkStatus(), 2000);
+        setSuccess('Browser window opened. Please log in to your Google account in that window. Then click "Refresh Status" to check.');
+        // Check status once after a delay, then let user manually refresh
+        setTimeout(() => {
+          checkStatus();
+        }, 10000); // Check once after 10 seconds
       } else {
-        setError('Failed to open login page');
+        const errorData = await res.json().catch(() => ({}));
+        setError(errorData.error || 'Failed to open login page');
       }
     } catch (e) {
       setError('Failed to open login page');
@@ -154,6 +168,9 @@ function App() {
               Authenticate with Google
             </button>
           )}
+          <button className="button button-secondary" onClick={checkStatus} disabled={loading} style={{ marginLeft: 'auto' }}>
+            Refresh Status
+          </button>
         </div>
       </div>
 

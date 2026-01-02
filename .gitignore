@@ -3,7 +3,13 @@ dist/
 frontend/node_modules/
 frontend/dist/
 data/
+frontend/data/
 .env
 *.log
 .DS_Store
+*.db
+credentials.json
+token.json
+**/credentials.json
+**/token.json
 

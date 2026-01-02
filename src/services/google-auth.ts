@@ -2,8 +2,26 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
 
-const TOKEN_PATH = path.join(process.cwd(), 'data', 'token.json');
-const CREDENTIALS_PATH = path.join(process.cwd(), 'data', 'credentials.json');
+// Get the project root directory (where package.json is)
+// When compiled, __dirname will be dist/, so we go up one level
+function getProjectRoot(): string {
+  // If running from dist/, go up to project root
+  if (__dirname.endsWith('dist')) {
+    return path.dirname(__dirname);
+  }
+  // If running from src/ (ts-node-dev), go up to project root
+  if (__dirname.endsWith('src')) {
+    return path.dirname(__dirname);
+  }
+  // Otherwise use process.cwd()
+  return process.cwd();
+}
+
+const PROJECT_ROOT = getProjectRoot();
+const TOKEN_PATH = path.join(PROJECT_ROOT, 'data', 'token.json');
+const CREDENTIALS_PATH = path.join(PROJECT_ROOT, 'data', 'credentials.json');
+
+console.log('OAuth paths:', { PROJECT_ROOT, TOKEN_PATH, CREDENTIALS_PATH, exists: fs.existsSync(CREDENTIALS_PATH) });
 
 const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
@@ -25,33 +43,78 @@ export class GoogleAuthService {
   }
 
   private loadCredentials(): void {
-    if (fs.existsSync(CREDENTIALS_PATH)) {
-      this.credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf-8'));
-    } else if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-      this.credentials = {
-        client_id: process.env.GOOGLE_CLIENT_ID,
-        client_secret: process.env.GOOGLE_CLIENT_SECRET,
-        redirect_uri: process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/callback'
-      };
-    }
-
-    if (this.credentials) {
-      this.oauth2Client = new google.auth.OAuth2(
-        this.credentials.client_id,
-        this.credentials.client_secret,
-        this.credentials.redirect_uri
-      );
-
-      // Load existing token
-      if (fs.existsSync(TOKEN_PATH)) {
-        const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf-8'));
-        this.oauth2Client.setCredentials(token);
+    try {
+      // Try multiple possible paths
+      const possiblePaths = [
+        CREDENTIALS_PATH,
+        path.join(process.cwd(), 'data', 'credentials.json'),
+        path.join(__dirname, '..', '..', 'data', 'credentials.json'),
+        path.join(__dirname, '..', 'data', 'credentials.json'),
+        './data/credentials.json'
+      ];
+      
+      let credentialsPath: string | null = null;
+      for (const p of possiblePaths) {
+        if (fs.existsSync(p)) {
+          credentialsPath = p;
+          break;
+        }
       }
+      
+      if (credentialsPath) {
+        const content = fs.readFileSync(credentialsPath, 'utf-8');
+        this.credentials = JSON.parse(content);
+        console.log('Loaded OAuth credentials from:', credentialsPath);
+      } else if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+        this.credentials = {
+          client_id: process.env.GOOGLE_CLIENT_ID,
+          client_secret: process.env.GOOGLE_CLIENT_SECRET,
+          redirect_uri: process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/callback'
+        };
+        console.log('Loaded OAuth credentials from environment');
+      } else {
+        console.error('OAuth credentials not found. Tried paths:', possiblePaths);
+        return;
+      }
+
+      if (this.credentials && this.credentials.client_id && this.credentials.client_secret) {
+        this.oauth2Client = new google.auth.OAuth2(
+          this.credentials.client_id,
+          this.credentials.client_secret,
+          this.credentials.redirect_uri
+        );
+        console.log('OAuth2 client created successfully');
+
+        // Load existing token
+        const tokenPaths = [
+          TOKEN_PATH,
+          path.join(process.cwd(), 'data', 'token.json'),
+          path.join(__dirname, '..', '..', 'data', 'token.json')
+        ];
+        
+        for (const tokenPath of tokenPaths) {
+          if (fs.existsSync(tokenPath)) {
+            try {
+              const token = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
+              this.oauth2Client.setCredentials(token);
+              console.log('Loaded existing OAuth token from:', tokenPath);
+              break;
+            } catch (e) {
+              console.error('Failed to load token from', tokenPath, ':', e);
+            }
+          }
+        }
+      } else {
+        console.error('Invalid OAuth credentials format. Has client_id:', !!this.credentials?.client_id, 'Has client_secret:', !!this.credentials?.client_secret);
+      }
+    } catch (e) {
+      console.error('Error loading OAuth credentials:', e);
     }
   }
 
   getAuthUrl(): string {
     if (!this.oauth2Client) {
+      console.error('OAuth2 client not initialized. Credentials:', !!this.credentials);
       throw new Error('OAuth credentials not configured');
     }
 
