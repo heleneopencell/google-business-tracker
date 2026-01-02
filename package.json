@@ -1,0 +1,37 @@
+{
+  "name": "google-business-tracker",
+  "version": "1.0.0",
+  "description": "Track Google Maps business listings over time",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && npm run frontend:build",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "cli": "node dist/cli.js",
+    "frontend:dev": "cd frontend && npm run dev",
+    "frontend:build": "cd frontend && npm run build",
+    "install:all": "npm install && cd frontend && npm install"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.40.0",
+    "googleapis": "^126.0.1",
+    "sqlite3": "^5.1.6",
+    "better-sqlite3": "^9.2.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.5",
+    "@types/cors": "^2.8.17",
+    "@types/uuid": "^9.0.7",
+    "typescript": "^5.3.3",
+    "ts-node-dev": "^2.0.0"
+  }
+}
+
