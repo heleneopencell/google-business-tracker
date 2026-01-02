@@ -145,6 +145,76 @@ function App() {
     }
   };
 
+  const handleRunCheckAll = async () => {
+    if (businesses.length === 0) {
+      setError('No businesses to check');
+      return;
+    }
+
+    if (!confirm(`Run checks for all ${businesses.length} businesses? This may take a while.`)) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const res = await fetch('/api/businesses/check-all', {
+        method: 'POST'
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.failed === 0) {
+          setSuccess(`Successfully checked all ${data.checked} businesses!`);
+        } else {
+          setSuccess(`Checked ${data.checked} businesses. ${data.failed} failed.`);
+          if (data.errors && data.errors.length > 0) {
+            const errorDetails = data.errors.map((e: any) => `${e.name || `Business ${e.id}`}: ${e.error}`).join('; ');
+            console.error('Check errors:', errorDetails);
+          }
+        }
+        loadBusinesses();
+      } else {
+        const errorData = await res.json();
+        setError(errorData.error || 'Failed to run checks');
+      }
+    } catch (e) {
+      setError('Failed to run checks');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteBusiness = async (id: number, name: string | null) => {
+    if (!confirm(`Are you sure you want to delete "${name || 'this business'}"? This will remove it from tracking, but the Google Sheet will remain.`)) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const res = await fetch(`/api/businesses/${id}`, {
+        method: 'DELETE'
+      });
+
+      if (res.ok) {
+        setSuccess('Business deleted successfully!');
+        loadBusinesses();
+      } else {
+        const errorData = await res.json();
+        setError(errorData.error || 'Failed to delete business');
+      }
+    } catch (e) {
+      setError('Failed to delete business');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="container">
       <div className="header">
@@ -196,7 +266,19 @@ function App() {
       </form>
 
       <div className="business-list">
-        <h2 style={{ padding: '20px', borderBottom: '1px solid #eee' }}>Businesses</h2>
+        <div style={{ padding: '20px', borderBottom: '1px solid #eee', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <h2 style={{ margin: 0 }}>Businesses</h2>
+          {businesses.length > 0 && (
+            <button
+              className="button button-primary"
+              onClick={handleRunCheckAll}
+              disabled={loading || !loggedIn || !authenticated}
+              style={{ fontSize: '14px', padding: '8px 16px' }}
+            >
+              Run Check All ({businesses.length})
+            </button>
+          )}
+        </div>
         {businesses.length === 0 ? (
           <div className="loading">No businesses added yet.</div>
         ) : (
@@ -227,6 +309,14 @@ function App() {
                   disabled={loading || !loggedIn || !authenticated}
                 >
                   Run Check
+                </button>
+                <button
+                  className="button button-secondary"
+                  onClick={() => handleDeleteBusiness(business.id, business.name)}
+                  disabled={loading}
+                  style={{ background: '#dc3545', color: 'white' }}
+                >
+                  Delete
                 </button>
               </div>
             </div>
