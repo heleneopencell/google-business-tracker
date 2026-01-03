@@ -99,18 +99,57 @@ export function createBusinessesRouter(businessService: BusinessService): Router
 
         console.log(`[Check All] Starting checks for ${allBusinesses.length} businesses...`);
 
-        for (const business of allBusinesses) {
+        // Process all businesses in parallel for maximum speed
+        // All businesses will be checked simultaneously
+        const CONCURRENCY = allBusinesses.length;
+        const results: Array<{ success: boolean; id: number; name: string | null; error?: string }> = [];
+        
+        // Process with concurrency limit - start next business as soon as one finishes
+        const processBusiness = async (business: any): Promise<void> => {
           try {
             console.log(`[Check All] Checking business ${business.id} (${business.name || 'Unknown'})...`);
             await businessService.runCheck(business.id, force);
-            checked++;
             console.log(`[Check All] Successfully checked business ${business.id}`);
+            results.push({ success: true, id: business.id, name: business.name });
           } catch (e: any) {
-            failed++;
             const errorMsg = e.message || 'Unknown error';
-            errors.push({ id: business.id, name: business.name, error: errorMsg });
             console.error(`[Check All] Failed to check business ${business.id}: ${errorMsg}`);
-            // Continue with other businesses even if one fails
+            results.push({ success: false, id: business.id, name: business.name, error: errorMsg });
+          }
+        };
+
+        // Process all businesses with concurrency limit
+        const workers: Promise<void>[] = [];
+        let index = 0;
+
+        const runWorker = async (): Promise<void> => {
+          while (index < allBusinesses.length) {
+            const businessIndex = index++;
+            if (businessIndex < allBusinesses.length) {
+              await processBusiness(allBusinesses[businessIndex]);
+            }
+          }
+        };
+
+        // Start workers (up to CONCURRENCY limit)
+        for (let i = 0; i < Math.min(CONCURRENCY, allBusinesses.length); i++) {
+          workers.push(runWorker());
+        }
+
+        // Wait for all workers to complete
+        await Promise.all(workers);
+
+        // Process results
+        for (const result of results) {
+          if (result.success) {
+            checked++;
+          } else {
+            failed++;
+            errors.push({ 
+              id: result.id, 
+              name: result.name, 
+              error: result.error || 'Unknown error' 
+            });
           }
         }
 

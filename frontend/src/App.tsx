@@ -15,6 +15,7 @@ function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [businesses, setBusinesses] = useState<Business[]>([]);
   const [loading, setLoading] = useState(false);
+  const [checkAllLoading, setCheckAllLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [newBusinessUrl, setNewBusinessUrl] = useState('');
@@ -71,10 +72,15 @@ function App() {
         }, 10000); // Check once after 10 seconds
       } else {
         const errorData = await res.json().catch(() => ({}));
-        setError(errorData.error || 'Failed to open login page');
+        const errorMsg = errorData.details 
+          ? `${errorData.error}: ${errorData.details}`
+          : (errorData.error || 'Failed to open login page');
+        setError(errorMsg);
+        console.error('Login error:', errorData);
       }
-    } catch (e) {
-      setError('Failed to open login page');
+    } catch (e: any) {
+      setError(`Failed to open login page: ${e?.message || 'Network error'}`);
+      console.error('Login exception:', e);
     } finally {
       setLoading(false);
     }
@@ -155,7 +161,7 @@ function App() {
       return;
     }
 
-    setLoading(true);
+    setCheckAllLoading(true);
     setError(null);
     setSuccess(null);
 
@@ -183,7 +189,7 @@ function App() {
     } catch (e) {
       setError('Failed to run checks');
     } finally {
-      setLoading(false);
+      setCheckAllLoading(false);
     }
   };
 
@@ -228,12 +234,12 @@ function App() {
           </div>
         </div>
         <div style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
-          {loggedIn === false && (
+          {loggedIn !== true && (
             <button className="button button-primary" onClick={handleOpenLogin} disabled={loading}>
-              Open Login
+              {loggedIn === false ? 'Open Login' : 'Login to Google Maps'}
             </button>
           )}
-          {authenticated === false && (
+          {authenticated !== true && (
             <button className="button button-primary" onClick={handleAuthenticate} disabled={loading}>
               Authenticate with Google
             </button>
@@ -272,13 +278,28 @@ function App() {
             <button
               className="button button-primary"
               onClick={handleRunCheckAll}
-              disabled={loading || !loggedIn || !authenticated}
-              style={{ fontSize: '14px', padding: '8px 16px' }}
+              disabled={loading || checkAllLoading || !loggedIn || !authenticated}
+              style={{ fontSize: '14px', padding: '8px 16px', opacity: checkAllLoading ? 0.7 : 1 }}
             >
-              Run Check All ({businesses.length})
+              {checkAllLoading ? `Processing... (${businesses.length})` : `Run Check All (${businesses.length})`}
             </button>
           )}
         </div>
+        {checkAllLoading && (
+          <div style={{ padding: '15px 20px', background: '#f0f7ff', borderBottom: '1px solid #ddd', display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <div style={{ 
+              width: '16px', 
+              height: '16px', 
+              border: '2px solid #4a90e2', 
+              borderTop: '2px solid transparent', 
+              borderRadius: '50%', 
+              animation: 'spin 1s linear infinite' 
+            }}></div>
+            <span style={{ color: '#4a90e2', fontWeight: '500' }}>
+              Running checks for all businesses... This may take a few minutes.
+            </span>
+          </div>
+        )}
         {businesses.length === 0 ? (
           <div className="loading">No businesses added yet.</div>
         ) : (

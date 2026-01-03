@@ -2,6 +2,7 @@
 
 import { initDatabase } from './db/schema';
 import { PlaywrightService } from './services/playwright';
+import { SessionService } from './services/session';
 import { GoogleAuthService } from './services/google-auth';
 import { GoogleSheetsService } from './services/google-sheets';
 import { GoogleDriveService } from './services/google-drive';
@@ -11,6 +12,7 @@ import { withLock } from './utils/lock';
 async function runDailyCheck() {
   const db = initDatabase();
   const playwright = new PlaywrightService();
+  const sessionService = new SessionService();
   const authService = new GoogleAuthService();
   const sheetsService = new GoogleSheetsService(authService);
   const driveService = new GoogleDriveService(authService);
@@ -19,13 +21,14 @@ async function runDailyCheck() {
     playwright,
     sheetsService,
     driveService,
-    authService
+    authService,
+    sessionService
   );
 
   try {
     await withLock(async () => {
       // Check session
-      const loggedIn = await playwright.checkLoggedIn();
+      const loggedIn = await sessionService.checkLoggedIn();
       if (!loggedIn) {
         throw new Error('NOT_LOGGED_IN');
       }
@@ -78,6 +81,7 @@ async function runDailyCheck() {
     process.exit(1);
   } finally {
     await playwright.close();
+    await sessionService.close();
     db.close();
   }
 }

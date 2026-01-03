@@ -3,6 +3,7 @@ import cors from 'cors';
 import path from 'path';
 import { initDatabase } from './db/schema';
 import { PlaywrightService } from './services/playwright';
+import { SessionService } from './services/session';
 import { GoogleAuthService } from './services/google-auth';
 import { GoogleSheetsService } from './services/google-sheets';
 import { GoogleDriveService } from './services/google-drive';
@@ -21,6 +22,7 @@ app.use(express.json());
 // Initialize services
 const db = initDatabase();
 const playwright = new PlaywrightService();
+const sessionService = new SessionService();
 const authService = new GoogleAuthService();
 const sheetsService = new GoogleSheetsService(authService);
 const driveService = new GoogleDriveService(authService);
@@ -29,11 +31,12 @@ const businessService = new BusinessService(
   playwright,
   sheetsService,
   driveService,
-  authService
+  authService,
+  sessionService
 );
 
 // Routes
-app.use('/api/session', createSessionRouter(playwright));
+app.use('/api/session', createSessionRouter(sessionService));
 app.use('/api/businesses', createBusinessesRouter(businessService));
 app.use('/api/auth', createAuthRouter(authService));
 
@@ -48,12 +51,14 @@ if (process.env.NODE_ENV === 'production') {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   await playwright.close();
+  await sessionService.close();
   db.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   await playwright.close();
+  await sessionService.close();
   db.close();
   process.exit(0);
 });

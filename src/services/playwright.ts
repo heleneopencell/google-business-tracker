@@ -1,14 +1,15 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
-import path from 'path';
 import fs from 'fs';
 import { ExtractedData, OpenClosedStatus, ErrorCode } from '../types/snapshot';
-
-const PROFILE_PATH = path.join(process.cwd(), 'data', 'playwright-profile');
+import { BROWSER_ARGS, BROWSER_CONFIG, addAntiDetectionScripts } from '../utils/browser-config';
+import { loadStorageState, saveStorageState, ensureProfileDirectory } from '../utils/storage-state';
+import { CONFIG } from '../config/constants';
+import { logger } from '../utils/logger';
+import { safeLocatorCheck, safePageOperation } from '../utils/promise-helpers';
 
 export class PlaywrightService {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
-  private loginInProgress: boolean = false;
 
   async getContext(): Promise<BrowserContext> {
     if (this.context) {
@@ -19,72 +20,26 @@ export class PlaywrightService {
       this.browser = await chromium.launch({
         headless: false, // Required for logged-in session
         channel: 'chromium',
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--disable-dev-shm-usage',
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-web-security',
-          '--disable-features=IsolateOrigins,site-per-process'
-        ]
+        args: BROWSER_ARGS
       });
     }
 
-    // Ensure profile directory exists
-    if (!fs.existsSync(PROFILE_PATH)) {
-      fs.mkdirSync(PROFILE_PATH, { recursive: true });
-    }
-
-    const storageStatePath = path.join(PROFILE_PATH, 'storage.json');
-    let storageState: any = undefined;
-    if (fs.existsSync(storageStatePath)) {
-      try {
-        storageState = JSON.parse(fs.readFileSync(storageStatePath, 'utf-8'));
-      } catch (e) {
-        // Invalid storage state, ignore
-      }
-    }
+    ensureProfileDirectory();
+    const storageState = loadStorageState();
 
     this.context = await this.browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      locale: 'en-US',
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      storageState: storageState,
-      // Remove automation indicators
-      ignoreHTTPSErrors: true
+      ...BROWSER_CONFIG,
+      storageState: storageState
     });
     
-    // Remove webdriver property
-    await this.context.addInitScript(() => {
-      // @ts-ignore - browser context
-      if (typeof navigator !== 'undefined') {
-        // @ts-ignore - browser context
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => false,
-        });
-        
-        // @ts-ignore - browser context
-        Object.defineProperty(navigator, 'plugins', {
-          get: () => [1, 2, 3, 4, 5],
-        });
-        
-        // @ts-ignore - browser context
-        Object.defineProperty(navigator, 'languages', {
-          get: () => ['en-US', 'en'],
-        });
-      }
-    });
+    await addAntiDetectionScripts(this.context);
 
     return this.context;
   }
 
   async saveStorageState(): Promise<void> {
     if (this.context) {
-      const storageState = await this.context.storageState();
-      fs.writeFileSync(
-        path.join(PROFILE_PATH, 'storage.json'),
-        JSON.stringify(storageState, null, 2)
-      );
+      await saveStorageState(this.context);
     }
   }
 
@@ -95,177 +50,6 @@ export class PlaywrightService {
       this.context = null;
     }
     // Next getContext() call will create new context with latest storage
-  }
-
-  async checkLoggedIn(): Promise<boolean> {
-    // Only reload context if storage file was recently updated (within last 5 seconds)
-    const storageStatePath = path.join(PROFILE_PATH, 'storage.json');
-    if (fs.existsSync(storageStatePath)) {
-      const stats = fs.statSync(storageStatePath);
-      const age = Date.now() - stats.mtimeMs;
-      // If storage was updated recently, reload context
-      if (age < 5000) {
-        await this.reloadContext();
-      }
-    }
-    
-    const context = await this.getContext();
-    const page = await context.newPage();
-    
-    try {
-      await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(3000); // Wait for page to fully render
-      
-      // Multiple ways to check if logged in
-      const checks = await Promise.all([
-        // Check for account avatar/button
-        page.locator('[data-value="Account"], button[aria-label*="Account"], [aria-label*="Google Account"]').first().isVisible().catch(() => false),
-        // Check for profile picture
-        page.locator('img[alt*="Account"], img[alt*="Profile"]').first().isVisible().catch(() => false),
-        // Check for account menu
-        page.locator('[role="button"][aria-label*="Account"]').first().isVisible().catch(() => false),
-        // Check cookies for logged-in indicators
-        page.evaluate(() => {
-          // @ts-ignore - browser context
-          return (typeof document !== 'undefined' && (document.cookie.includes('SID') || document.cookie.includes('HSID') || document.cookie.includes('SSID'))) || false;
-        }).catch(() => false)
-      ]);
-      
-      const isLoggedIn = checks.some((check: boolean | undefined) => check === true);
-      
-      // Check for sign in button (logged out indicator)
-      const signInVisible = await page.locator('text=/sign in/i, button:has-text("Sign in")').first().isVisible().catch(() => false);
-      
-      await page.close();
-      
-      if (isLoggedIn) {
-        // Save state when we detect login (in case it wasn't saved)
-        await this.saveStorageState();
-        return true;
-      }
-      
-      if (signInVisible) {
-        return false;
-      }
-      
-      // If we can't determine, assume not logged in
-      return false;
-    } catch (e) {
-      await page.close();
-      console.error('Error checking login status:', e);
-      return false;
-    }
-  }
-
-  async openLoginPage(): Promise<void> {
-    // Prevent multiple simultaneous login attempts
-    if (this.loginInProgress) {
-      console.log('Login already in progress. Please wait...');
-      return;
-    }
-    
-    this.loginInProgress = true;
-    
-    try {
-      // First check if already logged in
-      const alreadyLoggedIn = await this.checkLoggedIn();
-      if (alreadyLoggedIn) {
-        console.log('Already logged in!');
-        this.loginInProgress = false;
-        return;
-      }
-      
-      const context = await this.getContext();
-      const page = await context.newPage();
-      
-      try {
-        // Navigate to Google Maps
-        await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(3000); // Wait for page to fully render
-        
-        // Check if already logged in on this page
-        const checks = await Promise.all([
-          page.locator('[data-value="Account"], button[aria-label*="Account"]').first().isVisible().catch(() => false),
-          page.locator('img[alt*="Account"], img[alt*="Profile"]').first().isVisible().catch(() => false),
-              page.evaluate(() => {
-                // @ts-ignore - browser context
-                return (typeof document !== 'undefined' && (document.cookie.includes('SID') || document.cookie.includes('HSID'))) || false;
-              }).catch(() => false)
-        ]);
-        
-        if (checks.some((check: boolean | undefined) => check === true)) {
-          await this.saveStorageState();
-          this.loginInProgress = false;
-          return;
-        }
-        
-        // Try to find and click sign in button
-        const signInButton = page.locator('text=/sign in/i, button:has-text("Sign in")').first();
-        const signInVisible = await signInButton.isVisible().catch(() => false);
-        
-        if (signInVisible) {
-          await signInButton.click();
-          await page.waitForTimeout(2000);
-        }
-        
-        // Keep the page open and wait for user to complete login
-        // Check periodically if user has logged in
-        let loggedIn = false;
-        const maxWaitTime = 600000; // 10 minutes max
-        const checkInterval = 5000; // Check every 5 seconds
-        const startTime = Date.now();
-        
-        console.log('Browser window opened. Please log in to your Google account.');
-        console.log('The app will automatically detect when you are logged in.');
-        
-        while (!loggedIn && (Date.now() - startTime) < maxWaitTime) {
-          await page.waitForTimeout(checkInterval);
-          
-          // Check if we're logged in using multiple methods
-          try {
-            const loginChecks = await Promise.all([
-              page.locator('[data-value="Account"], button[aria-label*="Account"]').first().isVisible().catch(() => false),
-              page.locator('img[alt*="Account"], img[alt*="Profile"]').first().isVisible().catch(() => false),
-              page.evaluate(() => {
-                // @ts-ignore - browser context
-                return (typeof document !== 'undefined' && (document.cookie.includes('SID') || document.cookie.includes('HSID') || document.cookie.includes('SSID'))) || false;
-              }).catch(() => false)
-            ]);
-            
-            if (loginChecks.some((check: boolean) => check === true)) {
-              loggedIn = true;
-              console.log('Login detected! Saving session...');
-              break;
-            }
-          } catch (e) {
-            // Continue waiting
-          }
-        }
-        
-        // Save storage state after login (or timeout)
-        if (loggedIn) {
-          await this.saveStorageState();
-          console.log('Session saved successfully!');
-        } else {
-          console.log('Login timeout. Please try again.');
-        }
-        
-        // Don't close the page - let user close it manually
-        if (loggedIn) {
-          console.log('You can now close the browser window and return to the app.');
-        }
-      } catch (e) {
-        // If there's an error, still try to save state
-        await this.saveStorageState().catch(() => {});
-        throw e;
-      } finally {
-        this.loginInProgress = false;
-      }
-      // Note: We intentionally don't close the page here so user can continue using it
-    } catch (e) {
-      this.loginInProgress = false;
-      throw e;
-    }
   }
 
   async detectInterstitial(page: Page): Promise<ErrorCode | null> {
@@ -290,52 +74,56 @@ export class PlaywrightService {
     return null;
   }
 
-  async extractBusinessData(url: string): Promise<ExtractedData> {
+  async extractBusinessData(url: string): Promise<{ extracted: ExtractedData; page: Page | null }> {
+    const extractionStartTime = Date.now();
     const context = await this.getContext();
     const page = await context.newPage();
     
     try {
       // Navigate to the URL
+      const navStartTime = Date.now();
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      
-      // Wait for initial page load
-      await page.waitForTimeout(3000);
+      const navElapsed = Date.now() - navStartTime;
+      if (navElapsed > 5000) {
+        logger.performanceWarning('page.goto', navElapsed, CONFIG.PERFORMANCE.PAGE_GOTO_SLOW);
+      }
       
       // Wait for business panel to appear - this is critical
       // Google Maps loads the business panel after the main map
+      // Use a single wait with reduced timeout
+      const waitStartTime = Date.now();
       try {
-        // Wait for the business name/header to appear - this indicates the business panel is loaded
-        await page.waitForSelector('h1.DUwDvf, h1.lfPIob, [data-value="title"], h1[class*="DUwDvf"], [aria-label*="title"]', { 
-          timeout: 15000,
+        await page.waitForSelector('h1.DUwDvf, h1.lfPIob, [data-value="title"], h1[class*="DUwDvf"], [aria-label*="title"], h1, [role="main"]', { 
+          timeout: 10000,
           state: 'visible'
         });
-        console.log('Business panel detected');
+        const waitElapsed = Date.now() - waitStartTime;
+        logger.debug(`Business panel detected (waited ${waitElapsed}ms)`);
+        logger.performance('waitForSelector', waitElapsed, CONFIG.PERFORMANCE.WAIT_SELECTOR_SLOW);
       } catch (e) {
-        console.log('Business panel not found, trying alternative selectors...');
-        // Try alternative selectors
-        try {
-          await page.waitForSelector('h1, [role="main"], [data-value="Overview"]', { timeout: 5000 });
-        } catch (e2) {
-          console.log('No business panel found');
-        }
+        const waitElapsed = Date.now() - waitStartTime;
+        logger.debug(`Business panel not found after ${waitElapsed}ms, continuing anyway...`);
       }
       
-      // Additional wait for dynamic content to load (address, phone, etc.)
-      await page.waitForTimeout(3000);
+      // Reduced wait - just enough for dynamic content
+      await page.waitForTimeout(1500);
       
       // Check for interstitials first
       const interstitialError = await this.detectInterstitial(page);
       if (interstitialError) {
         return {
-          link: url,
-          name: null,
-          address: null,
-          webpage: null,
-          phone: null,
-          openClosedStatus: 'UNKNOWN',
-          reviewCount: null,
-          starRating: null,
-          errorCode: interstitialError
+          extracted: {
+            link: url,
+            name: null,
+            address: null,
+            webpage: null,
+            phone: null,
+            openClosedStatus: 'UNKNOWN',
+            reviewCount: null,
+            starRating: null,
+            errorCode: interstitialError
+          },
+          page: null
         };
       }
 
@@ -343,7 +131,7 @@ export class PlaywrightService {
       try {
         const pageTitle = await page.title();
         const url = page.url();
-        console.log(`Extracting from page: ${pageTitle} (${url})`);
+        logger.debug(`Extracting from page: ${pageTitle} (${url})`);
       } catch (e) {
         // Ignore
       }
@@ -357,21 +145,133 @@ export class PlaywrightService {
         // Accessibility not available, use DOM fallback
       }
       
-      // Extract data
+      // Extract name first
+      const name = await this.extractName(page, a11ySnapshot);
+      
+      // Find the main business container using aria-label="[company name]"
+      // This is much more efficient - all business data is inside this container
+      const containerStartTime = Date.now();
+      let businessContainer: any = null;
+      if (name) {
+        try {
+          // Try to find element with aria-label matching the business name
+          // This is typically the main business panel container
+          const containerSelector = `[aria-label="${name}"], [aria-label*="${name}"]`;
+          const container = page.locator(containerSelector).first();
+          const isVisible = await Promise.race([
+            container.isVisible(),
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500))
+          ]).catch(() => false);
+          
+          if (isVisible) {
+            businessContainer = container;
+            const containerElapsed = Date.now() - containerStartTime;
+            logger.debug(`[Optimization] Found business container with aria-label="${name}" (took ${containerElapsed}ms)`);
+          } else {
+            // Fallback: Try role="main" with aria-label containing name
+            const mainContainer = page.locator('[role="main"][aria-label*]').first();
+            const mainAriaLabel = await mainContainer.getAttribute('aria-label').catch(() => null);
+            if (mainAriaLabel && mainAriaLabel.includes(name)) {
+              businessContainer = mainContainer;
+              const containerElapsed = Date.now() - containerStartTime;
+              logger.debug(`[Optimization] Found business container via role="main" with matching aria-label (took ${containerElapsed}ms)`);
+            } else {
+              const containerElapsed = Date.now() - containerStartTime;
+              logger.debug(`[Optimization] Could not find business container (took ${containerElapsed}ms), will search whole page`);
+            }
+          }
+        } catch (e) {
+          const containerElapsed = Date.now() - containerStartTime;
+          logger.debug(`[Optimization] Error finding business container (took ${containerElapsed}ms), will search whole page`);
+        }
+      }
+      
+      // Cache business name element for star rating extraction (optimization)
+      let cachedNameElement: any = null;
+      if (name && businessContainer) {
+        try {
+          // Find name element within the container
+          const nameSelectors = [
+            'h1.DUwDvf.lfPIob',
+            'h1.DUwDvf',
+            'h1.lfPIob',
+            'h1[class*="DUwDvf"]',
+            '[data-value="title"]',
+            'h1'
+          ];
+          
+          for (const selector of nameSelectors) {
+            try {
+              const nameElement = businessContainer.locator(selector).first();
+              const isVisible = await nameElement.isVisible().catch(() => false);
+              if (isVisible) {
+                cachedNameElement = nameElement;
+                break;
+              }
+            } catch (e) {
+              // Continue to next selector
+            }
+          }
+        } catch (e) {
+          // If caching fails, continue without cache
+        }
+      }
+      
+      // Extract other data in parallel for better performance
+      // Pass businessContainer to scope all searches within it
+      // Add individual timeouts to prevent one slow function from blocking everything
+      const parallelExtractionStartTime = Date.now();
+      const [
+        address,
+        webpage,
+        phone,
+        openClosedStatus,
+        reviewCount
+      ] = await Promise.all([
+        Promise.race([
+          this.extractAddress(page, businessContainer),
+          new Promise<string | null>((resolve) => setTimeout(() => { logger.warn('[Performance] extractAddress timed out after 10s'); resolve(null); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
+        ]),
+        Promise.race([
+          this.extractWebpage(page, businessContainer),
+          new Promise<string | null>((resolve) => setTimeout(() => { logger.warn('[Performance] extractWebpage timed out after 10s'); resolve(null); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
+        ]),
+        Promise.race([
+          this.extractPhone(page, businessContainer),
+          new Promise<string | null>((resolve) => setTimeout(() => { logger.warn('[Performance] extractPhone timed out after 10s'); resolve(null); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
+        ]),
+        Promise.race([
+          this.extractOpenClosedStatus(page, businessContainer),
+          new Promise<any>((resolve) => setTimeout(() => { logger.warn('[Performance] extractOpenClosedStatus timed out after 10s'); resolve('UNKNOWN'); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
+        ]),
+        Promise.race([
+          this.extractReviewCount(page, businessContainer),
+          new Promise<number | null>((resolve) => setTimeout(() => { logger.warn('[Performance] extractReviewCount timed out after 10s'); resolve(null); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
+        ])
+      ]);
+      const parallelExtractionElapsed = Date.now() - parallelExtractionStartTime;
+      logger.performance('Parallel extraction (address, webpage, phone, status, reviews)', parallelExtractionElapsed, CONFIG.PERFORMANCE.PARALLEL_EXTRACTION_SLOW);
+      logger.performanceWarning('Parallel extraction', parallelExtractionElapsed, CONFIG.PERFORMANCE.PARALLEL_EXTRACTION_SLOW);
+      
+      // Extract star rating - if no reviews, there should be no star rating
+      // Pass businessContainer and cached name element
+      const starRating = reviewCount === null ? null : await this.extractStarRating(page, name, cachedNameElement, businessContainer || undefined);
+      
       const extracted: ExtractedData = {
         link: url,
-        name: await this.extractName(page, a11ySnapshot),
-        address: await this.extractAddress(page),
-        webpage: await this.extractWebpage(page),
-        phone: await this.extractPhone(page),
-        openClosedStatus: await this.extractOpenClosedStatus(page),
-        reviewCount: await this.extractReviewCount(page),
-        starRating: await this.extractStarRating(page),
+        name,
+        address,
+        webpage,
+        phone,
+        openClosedStatus,
+        reviewCount,
+        starRating,
         errorCode: null
       };
       
       // Log extraction results for debugging
-      console.log('Extraction results:', {
+      const extractionElapsed = Date.now() - extractionStartTime;
+      logger.debug(`Extraction results (took ${extractionElapsed}ms):`, {
         name: extracted.name,
         address: extracted.address ? 'Found' : 'Not found',
         webpage: extracted.webpage,
@@ -385,23 +285,25 @@ export class PlaywrightService {
         extracted.errorCode = 'EXTRACTION_FAILED';
       }
 
-      return extracted;
+      return { extracted, page }; // Return both extracted data and page for reuse
     } catch (e) {
-      console.error('Extraction error:', e);
+      logger.error('Extraction error:', e);
       return {
-        link: url,
-        name: null,
-        address: null,
-        webpage: null,
-        phone: null,
-        openClosedStatus: 'UNKNOWN',
-        reviewCount: null,
-        starRating: null,
-        errorCode: 'PAGE_LOAD_FAILED'
+        extracted: {
+          link: url,
+          name: null,
+          address: null,
+          webpage: null,
+          phone: null,
+          openClosedStatus: 'UNKNOWN',
+          reviewCount: null,
+          starRating: null,
+          errorCode: 'PAGE_LOAD_FAILED'
+        },
+        page: null
       };
-    } finally {
-      await page.close();
     }
+    // Note: Page is NOT closed here - caller is responsible for closing it
   }
 
   private async extractName(page: Page, a11ySnapshot: any): Promise<string | null> {
@@ -499,7 +401,10 @@ export class PlaywrightService {
     return null;
   }
 
-  private async extractAddress(page: Page): Promise<string | null> {
+  private async extractAddress(page: Page, container?: any): Promise<string | null> {
+    // Use container if provided, otherwise search whole page
+    const searchContext = container || page;
+    
     // Try multiple Google Maps address selectors
     // Address is typically in a button with data-item-id="address" and aria-label="Address: ..."
     const selectors = [
@@ -513,7 +418,7 @@ export class PlaywrightService {
 
     for (const selector of selectors) {
       try {
-        const element = await page.locator(selector).first();
+        const element = searchContext.locator(selector).first();
         
         // First priority: Extract from aria-label (most reliable)
         // Format: "Address: 105 Rue La Fayette, 75010 Paris, France"
@@ -562,10 +467,16 @@ export class PlaywrightService {
       }
     }
 
-    // Heuristic fallback - look for address-like text in business panel
+    // Heuristic fallback - look for address-like text in business panel (with timeout)
+    // Use container if available, otherwise search for panel
     try {
-      const businessPanel = page.locator('[data-value="Overview"], [role="main"]').first();
-      const panelText = await businessPanel.textContent().catch(() => '');
+      const businessPanel = container 
+        ? container.locator('[data-value="Overview"]').first() || container
+        : page.locator('[data-value="Overview"], [role="main"]').first();
+      const panelText = await Promise.race([
+        businessPanel.textContent(),
+        new Promise<string>((resolve) => setTimeout(() => resolve(''), 1000)) // 1 second timeout
+      ]).catch(() => '');
       
       // More flexible address pattern
       const addressPatterns = [
@@ -586,18 +497,33 @@ export class PlaywrightService {
       // Fallback to body text
     }
 
-    // Last resort - body text
-    const bodyText = await page.textContent('body').catch(() => '');
-    const addressPattern = /(\d+[\s\w]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|way|circle|cir)[^,]*,\s*[^,]+)/i;
-    const match = bodyText?.match(addressPattern);
-    if (match) {
-      return match[1].trim();
+    // Last resort - container text (with timeout to avoid slow extraction)
+    // Only if container is available, otherwise skip (body text is too slow)
+    if (container) {
+      try {
+        const containerText = await Promise.race([
+          container.textContent(),
+          new Promise<string>((resolve) => setTimeout(() => resolve(''), 1000)) // 1 second timeout
+        ]).catch(() => '');
+      
+        if (containerText) {
+          const addressPattern = /(\d+[\s\w]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|way|circle|cir)[^,]*,\s*[^,]+)/i;
+          const match = containerText.match(addressPattern);
+          if (match) {
+            return match[1].trim();
+          }
+        }
+      } catch (e) {
+        // Timeout or error - skip container text extraction
+      }
     }
 
     return null;
   }
 
-  private async extractWebpage(page: Page): Promise<string | null> {
+  private async extractWebpage(page: Page, container?: any): Promise<string | null> {
+    // Use container if provided, otherwise search whole page
+    const searchContext = container || page;
     // Try multiple Google Maps website selectors
     // Website is typically in an <a> tag with data-item-id="authority" and aria-label="Website: ..."
     const selectors = [
@@ -676,11 +602,23 @@ export class PlaywrightService {
       }
     }
 
-    // Try finding link near "Website" text
+    // Try finding link near "Website" text (with timeout)
     try {
-      const websiteButton = await page.locator('button:has-text("Website"), [aria-label*="Website"]').first();
+      const websiteButton = searchContext.locator('button:has-text("Website"), [aria-label*="Website"]').first();
+      const isVisible = await Promise.race([
+        websiteButton.isVisible(),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500))
+      ]).catch(() => false);
+      
+      if (!isVisible) {
+        return null; // Website button not found, skip this fallback
+      }
+      
       const parent = websiteButton.locator('..');
-      const link = await parent.locator('a[href^="http"]').first().getAttribute('href').catch(() => null);
+      const link = await Promise.race([
+        parent.locator('a[href^="http"]').first().getAttribute('href'),
+        new Promise<string | null>((resolve) => setTimeout(() => resolve(null), 500))
+      ]).catch(() => null);
       if (link) {
         try {
           const url = new URL(link);
@@ -713,7 +651,10 @@ export class PlaywrightService {
     return null;
   }
 
-  private async extractPhone(page: Page): Promise<string | null> {
+  private async extractPhone(page: Page, container?: any): Promise<string | null> {
+    // Use container if provided, otherwise search whole page
+    const searchContext = container || page;
+    
     // Try multiple Google Maps phone selectors
     // Phone is typically in a button with data-item-id="phone:tel:..." and aria-label="Phone: ..."
     const selectors = [
@@ -729,7 +670,7 @@ export class PlaywrightService {
 
     for (const selector of selectors) {
       try {
-        const element = await page.locator(selector).first();
+        const element = searchContext.locator(selector).first();
         
         // First priority: Extract from data-item-id
         // Format: "phone:tel:+33781315377"
@@ -792,8 +733,11 @@ export class PlaywrightService {
     }
 
     // Regex fallback in business panel
+    // Use container if available, otherwise search for panel
     try {
-      const businessPanel = page.locator('[data-value="Overview"], [role="main"]').first();
+      const businessPanel = container 
+        ? container.locator('[data-value="Overview"]').first() || container
+        : page.locator('[data-value="Overview"], [role="main"]').first();
       const panelText = await businessPanel.textContent().catch(() => null);
       if (panelText) {
         const phonePattern = /(\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/;
@@ -809,10 +753,13 @@ export class PlaywrightService {
     return null;
   }
 
-  private async extractOpenClosedStatus(page: Page): Promise<OpenClosedStatus> {
+  private async extractOpenClosedStatus(page: Page, container?: any): Promise<OpenClosedStatus> {
+    // Use container if provided, otherwise search whole page
+    const searchContext = container || page;
+    
     // First, check for the "Show open hours for the week" indicator (business is active/open)
     try {
-      const openHoursButton = await page.locator('[aria-label*="Show open hours"], [aria-label*="show open hours"]').first();
+      const openHoursButton = searchContext.locator('[aria-label*="Show open hours"], [aria-label*="show open hours"]').first();
       const ariaLabel = await openHoursButton.getAttribute('aria-label').catch(() => null);
       if (ariaLabel && ariaLabel.toLowerCase().includes('show open hours')) {
         console.log('Found "Show open hours" indicator - business is OPEN');
@@ -851,33 +798,159 @@ export class PlaywrightService {
     return 'UNKNOWN';
   }
 
-  private async extractReviewCount(page: Page): Promise<number | null> {
-    // Try multiple selectors for review count
-    // Review count is typically in a span with role="img" and aria-label="208 reviews"
+  private async extractReviewCount(page: Page, container?: any): Promise<number | null> {
+    // Use container if provided, otherwise search whole page
+    const searchContext = container || page;
+    const startTime = Date.now();
+    const functionName = container ? 'extractReviewCount (with container)' : 'extractReviewCount (whole page)';
+    
+    // Get business name from container's aria-label if available
+    let businessName = '';
+    if (container) {
+      try {
+        businessName = await container.getAttribute('aria-label').catch(() => '') || '';
+      } catch (e) {
+        // Ignore
+      }
+    }
+    // Only extract from aria-label that explicitly contains "review" or "reviews" after the number
+    // Format: "1 review" (singular) or "208 reviews" (plural) or "1,234 reviews"
+    // Optimization: Use "Directions" button as boundary - only search before it
+    // If reviews aren't found before "Directions", return null immediately
+    
+    // Check if Directions button exists (cache this check)
+    let directionsExists = false;
+    try {
+      const directionsButton = page.locator('button[aria-label="Directions"], button[data-value="Directions"]').first();
+      directionsExists = await Promise.race([
+        directionsButton.isVisible(),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300))
+      ]).catch(() => false);
+    } catch (e) {
+      // Directions button not found, continue without boundary
+    }
+    
     const selectors = [
-      'span[role="img"][aria-label*="review"]',  // Most common - span with role="img" and aria-label
-      '[role="img"][aria-label*="review"]',       // Any element with role="img" and aria-label
-      'span[aria-label*="review"]',              // Span with aria-label
-      'button[aria-label*="review"]',           // Button with aria-label
-      '[data-value*="review"]',                 // Element with data-value
-      'button[aria-label*="reviews"]'           // Button with "reviews" in aria-label
+      'span[role="img"][aria-label*="review"]',  // Most common - try this first
+      '[role="img"][aria-label*="review"]',       // Fallback 1
+      'span[aria-label*="review"]',              // Fallback 2
+      'button[aria-label*="review"]'            // Fallback 3
     ];
 
+    // Try selectors sequentially with early exit - faster for businesses without reviews
+    // Optimization: Check all selectors at once using evaluate to find the first valid one before Directions
+    if (directionsExists) {
+      // If Directions exists, use a single evaluate call to find the first review element before Directions
+      try {
+        const evalStartTime = Date.now();
+        // @ts-ignore - browser context
+        const result = await page.evaluate(([selectors, businessName]: [string[], string]) => {
+          // @ts-ignore - browser context
+          // @ts-ignore - browser context
+          // @ts-ignore - browser context
+          const searchContainer = businessName 
+            // @ts-ignore - browser context
+            ? (document.querySelector(`[aria-label="${businessName}"], [aria-label*="${businessName}"]`) || document)
+            // @ts-ignore - browser context
+            : document;
+          
+          // @ts-ignore - browser context
+          const directionsEl = searchContainer.querySelector('button[aria-label="Directions"], button[data-value="Directions"]');
+          if (!directionsEl) return null;
+          
+          // Try each selector in order - but limit to first 50 elements per selector to avoid slow iteration
+          for (const sel of selectors) {
+            // @ts-ignore - browser context
+            const allElements = searchContainer.querySelectorAll(sel);
+            // Limit iteration to first 50 elements to avoid slow processing on pages with many elements
+            const maxElements = Math.min(allElements.length, 50);
+            for (let i = 0; i < maxElements; i++) {
+              // @ts-ignore - browser context
+              const element = allElements[i] as Element;
+              // Check if element is visible and before Directions
+              // @ts-ignore - browser context
+              const rect = element.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue; // Not visible
+              
+              // Check if element is before Directions using compareDocumentPosition
+              // @ts-ignore - browser context
+              const isBefore = (element.compareDocumentPosition(directionsEl) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+              if (!isBefore) {
+                // If we've passed Directions, no point checking more elements from this selector
+                break;
+              }
+              
+              // Get aria-label
+              const ariaLabel = element.getAttribute('aria-label');
+              if (!ariaLabel || (!ariaLabel.toLowerCase().includes('review') && !ariaLabel.toLowerCase().includes('reviews'))) continue;
+              
+              // Extract number
+              const reviewMatch = ariaLabel.match(/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*reviews?/i);
+              if (reviewMatch && reviewMatch[1]) {
+                const numStr = reviewMatch[1].replace(/[.,]/g, '');
+                const num = parseInt(numStr, 10);
+                if (!isNaN(num) && num >= 0) {
+                  return { selector: sel, count: num, ariaLabel };
+                }
+              }
+              // Try with K/M/B suffix
+              const suffixMatch = ariaLabel.match(/(\d+(?:[.,]\d+)?)\s*([kmb])\s*reviews?/i);
+              if (suffixMatch && suffixMatch[1] && suffixMatch[2]) {
+                const num = parseFloat(suffixMatch[1]);
+                const suffix = suffixMatch[2].toLowerCase();
+                let multiplier = 1;
+                if (suffix === 'k') multiplier = 1000;
+                else if (suffix === 'm') multiplier = 1000000;
+                else if (suffix === 'b') multiplier = 1000000000;
+                const result = Math.round(num * multiplier);
+                return { selector: sel, count: result, ariaLabel };
+              }
+            }
+          }
+          return null;
+        }, [selectors, businessName]).catch(() => null) as { selector: string; count: number; ariaLabel: string } | null;
+        const evalElapsed = Date.now() - evalStartTime;
+        if (evalElapsed > 1000) {
+          console.log(`[Performance] page.evaluate for review count took ${evalElapsed}ms - this is slow!`);
+        }
+        
+        if (result && result.count !== undefined) {
+          const elapsed = Date.now() - startTime;
+          console.log(`Extracted review count from aria-label using selector "${result.selector}": ${result.count} (took ${elapsed}ms)`);
+          return result.count;
+        }
+      } catch (e) {
+        // Fall through to sequential approach
+      }
+    }
+    
+    // Fallback: Sequential approach (for when Directions doesn't exist or evaluate failed)
     for (const selector of selectors) {
       try {
-        const element = await page.locator(selector).first();
+        const element = searchContext.locator(selector).first();
         
-        // First priority: Extract from aria-label
-        // Format: "208 reviews" or "1,234 reviews"
+        // Fast visibility check with timeout
+        const isVisible = await Promise.race([
+          element.isVisible(),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 200))
+        ]).catch(() => false);
+        
+        if (!isVisible) continue;
+        
+        // Extract from aria-label - must contain "review" or "reviews" after the number
         const ariaLabel = await element.getAttribute('aria-label').catch(() => null);
-        if (ariaLabel && ariaLabel.toLowerCase().includes('review')) {
-          // Extract number from aria-label like "208 reviews" or "1,234 reviews"
+        if (ariaLabel && (ariaLabel.toLowerCase().includes('review') || ariaLabel.toLowerCase().includes('reviews'))) {
+          // Extract number from aria-label like "1 review" or "208 reviews" or "1,234 reviews"
           const reviewMatch = ariaLabel.match(/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*reviews?/i);
           if (reviewMatch && reviewMatch[1]) {
             const numStr = reviewMatch[1].replace(/[.,]/g, '');
             const num = parseInt(numStr, 10);
-            if (!isNaN(num) && num > 0) {
-              console.log(`Extracted review count from aria-label using selector "${selector}": ${num}`);
+            if (!isNaN(num) && num >= 0) {
+              const elapsed = Date.now() - startTime;
+              console.log(`[${functionName}] Extracted review count from aria-label using selector "${selector}": ${num} (took ${elapsed}ms)`);
+              if (elapsed > 5000) {
+                console.log(`[Performance] WARNING: ${functionName} total time ${elapsed}ms - this is very slow!`);
+              }
               return num;
             }
           }
@@ -891,24 +964,12 @@ export class PlaywrightService {
             else if (suffix === 'm') multiplier = 1000000;
             else if (suffix === 'b') multiplier = 1000000000;
             const result = Math.round(num * multiplier);
-            console.log(`Extracted review count from aria-label with suffix: ${result}`);
-            return result;
-          }
-        }
-        
-        // Second priority: Extract from text content
-        // Format: "(208)" or "208"
-        const text = await element.textContent().catch(() => null);
-        if (text) {
-          // Try to extract number from text like "(208)" or "208"
-          const textMatch = text.match(/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)/);
-          if (textMatch && textMatch[1]) {
-            const numStr = textMatch[1].replace(/[.,]/g, '');
-            const num = parseInt(numStr, 10);
-            if (!isNaN(num) && num > 0) {
-              console.log(`Extracted review count from text content: ${num}`);
-              return num;
+            const elapsed = Date.now() - startTime;
+            console.log(`[${functionName}] Extracted review count from aria-label with suffix: ${result} (took ${elapsed}ms)`);
+            if (elapsed > 5000) {
+              console.log(`[Performance] WARNING: ${functionName} total time ${elapsed}ms - this is very slow!`);
             }
+            return result;
           }
         }
       } catch (e) {
@@ -916,112 +977,238 @@ export class PlaywrightService {
       }
     }
 
-    // Try business panel text
-    try {
-      const businessPanel = page.locator('[data-value="Overview"], [role="main"]').first();
-      const panelText = await businessPanel.textContent().catch(() => '');
-      
-      // Look for review count patterns
-      const patterns = [
-        /(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*reviews?/i,
-        /(\d+(?:[.,]\d+)?)\s*reviews?/i,
-        /reviews?[:\s]+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)/i
-      ];
-
-      if (panelText) {
-        for (const pattern of patterns) {
-          const match = panelText.match(pattern);
-          if (match) {
-            const numStr = match[1].replace(/[.,]/g, '');
-            const num = parseInt(numStr, 10);
-            if (!isNaN(num)) {
-              return num;
-            }
-          }
-        }
-
-        // Try K, M, B suffixes
-        const suffixPattern = /(\d+(?:[.,]\d+)?)\s*([kmb])\s*reviews?/i;
-        const suffixMatch = panelText.match(suffixPattern);
-        if (suffixMatch) {
-          const num = parseFloat(suffixMatch[1]);
-          const suffix = suffixMatch[2].toLowerCase();
-          let multiplier = 1;
-          if (suffix === 'k') multiplier = 1000;
-          else if (suffix === 'm') multiplier = 1000000;
-          else if (suffix === 'b') multiplier = 1000000000;
-          return Math.round(num * multiplier);
-        }
-      }
-    } catch (e) {
-      // Fallback to body
+    // No review count found before Directions button - return null
+    const elapsed = Date.now() - startTime;
+    console.log(`[${functionName}] No review count found before "Directions" button - returning null (took ${elapsed}ms)`);
+    if (elapsed > 5000) {
+      console.log(`[Performance] WARNING: ${functionName} took ${elapsed}ms - this is very slow!`);
     }
-
-    // Last resort - body text
-    const bodyText = await page.textContent('body').catch(() => '');
-    if (!bodyText) return null;
-
-    const patterns = [
-      /(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*reviews?/i,
-      /(\d+(?:[.,]\d+)?)\s*reviews?/i
-    ];
-
-    for (const pattern of patterns) {
-      const match = bodyText.match(pattern);
-      if (match) {
-        const numStr = match[1].replace(/[.,]/g, '');
-        const num = parseInt(numStr, 10);
-        if (!isNaN(num)) {
-          return num;
-        }
-      }
-    }
-
-    // Try K, M, B suffixes
-    const suffixPattern = /(\d+(?:[.,]\d+)?)\s*([kmb])\s*reviews?/i;
-    const suffixMatch = bodyText.match(suffixPattern);
-    if (suffixMatch) {
-      const num = parseFloat(suffixMatch[1]);
-      const suffix = suffixMatch[2].toLowerCase();
-      let multiplier = 1;
-      if (suffix === 'k') multiplier = 1000;
-      else if (suffix === 'm') multiplier = 1000000;
-      else if (suffix === 'b') multiplier = 1000000000;
-      return Math.round(num * multiplier);
-    }
-
     return null;
   }
 
-  private async extractStarRating(page: Page): Promise<number | null> {
-    // Try multiple selectors for star rating
-    // Star rating is typically in a span with role="img" and aria-label="4.5 stars "
+  private async extractStarRating(page: Page, businessName: string | null, cachedNameElement?: any, container?: any): Promise<number | null> {
+    const startTime = Date.now();
+    // Only extract from aria-label that explicitly contains "stars" (plural) after the number
+    // Format: "4.5 stars " or "0.0 stars" - must have "stars" (not just "star" or "rating")
+    // IMPORTANT: Only look before "Directions" button - if not found before it, return null
+    
+    // Get business name from container's aria-label if available and businessName is null
+    let extractedBusinessName = businessName || '';
+    if (!extractedBusinessName && container) {
+      try {
+        extractedBusinessName = await container.getAttribute('aria-label').catch(() => '') || '';
+      } catch (e) {
+        // Ignore
+      }
+    }
+    
+    // Check if Directions button exists (cache this check)
+    let directionsExists = false;
+    try {
+      const directionsButton = page.locator('button[aria-label="Directions"], button[data-value="Directions"]').first();
+      directionsExists = await Promise.race([
+        directionsButton.isVisible(),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300))
+      ]).catch(() => false);
+    } catch (e) {
+      // Directions button not found, continue without boundary
+    }
+    
+    // Determine search context - prioritize business header/top section
+    let searchContext: any = null;
+    
+    // If we have a cached name element, use it directly (optimization)
+    if (cachedNameElement) {
+      try {
+        // Search in parent containers (header section) - max 3 levels up
+        const parent = cachedNameElement.locator('..').first();
+        const grandParent = parent.locator('..').first();
+        const greatGrandParent = grandParent.locator('..').first();
+        searchContext = parent; // Start with immediate parent
+      } catch (e) {
+        // If parent traversal fails, fall back to header section selectors
+      }
+    }
+    
+    // If no cached element or parent traversal failed, try to find business header section
+    if (!searchContext) {
+      // Look for business panel/header section - this is where rating should be
+      const headerSelectors = [
+        '[data-value="Overview"]',
+        '[role="main"]',
+        'div[jsaction*="pane"]',
+        'div[data-value]'
+      ];
+      
+      for (const headerSelector of headerSelectors) {
+        try {
+          const headerElement = page.locator(headerSelector).first();
+          const isVisible = await headerElement.isVisible().catch(() => false);
+          if (isVisible) {
+            searchContext = headerElement;
+            break;
+          }
+        } catch (e) {
+          // Continue to next selector
+        }
+      }
+    }
+    
+    // If still no context found, try to find business name element (fallback, but shouldn't happen often)
+    if (!searchContext && businessName) {
+      try {
+        const nameSelectors = [
+          'h1.DUwDvf.lfPIob',
+          'h1.DUwDvf',
+          '[data-value="title"]'
+        ];
+        
+        for (const nameSelector of nameSelectors) {
+          try {
+            const nameElement = page.locator(nameSelector).first();
+            const isVisible = await nameElement.isVisible().catch(() => false);
+            if (isVisible) {
+              searchContext = nameElement.locator('..').first(); // Use parent
+              break;
+            }
+          } catch (e) {
+            // Continue
+          }
+        }
+      } catch (e) {
+        // Fall through to use page as last resort
+      }
+    }
+    
+    // Final fallback: use page, but this should rarely happen
+    if (!searchContext) {
+      searchContext = page;
+    }
+    
     const selectors = [
-      'span[role="img"][aria-label*="star"]',  // Most common - span with role="img" and aria-label
-      '[role="img"][aria-label*="star"]',       // Any element with role="img" and aria-label
-      'span[aria-label*="star"]',              // Span with aria-label
-      'button[aria-label*="star"]',            // Button with aria-label
-      '[aria-label*="rating"]',                // Element with rating in aria-label
-      '[data-value*="rating"]',                // Element with data-value
+      'span[role="img"][aria-label*="stars"]',  // Most common - span with role="img" and aria-label containing "stars"
+      '[role="img"][aria-label*="stars"]',       // Any element with role="img" and aria-label containing "stars"
+      'span[aria-label*="stars"]',              // Span with aria-label containing "stars"
       'button[aria-label*="stars"]'            // Button with "stars" in aria-label
     ];
 
+    // Try all selectors in the header/top section context
+    // Optimization: If Directions exists and searching whole page, use a single evaluate call
+    if (directionsExists && searchContext === page) {
+      try {
+        // @ts-ignore - browser context
+        const result = await page.evaluate(([selectors, businessName]: [string[], string]) => {
+          // @ts-ignore - browser context
+          // @ts-ignore - browser context
+          // @ts-ignore - browser context
+          const searchContainer = businessName 
+            // @ts-ignore - browser context
+            ? (document.querySelector(`[aria-label="${businessName}"], [aria-label*="${businessName}"]`) || document)
+            // @ts-ignore - browser context
+            : document;
+          
+          // @ts-ignore - browser context
+          const directionsEl = searchContainer.querySelector('button[aria-label="Directions"], button[data-value="Directions"]');
+          if (!directionsEl) return null;
+          
+          // Try each selector in order
+          for (const sel of selectors) {
+            // @ts-ignore - browser context
+            const elements = Array.from(searchContainer.querySelectorAll(sel));
+            for (const el of elements) {
+              // @ts-ignore - browser context
+              const element = el as Element;
+              // Check if element is visible and before Directions
+              // @ts-ignore - browser context
+              const rect = element.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue; // Not visible
+              
+              // Check if element is before Directions using compareDocumentPosition
+              // @ts-ignore - browser context
+              const isBefore = (element.compareDocumentPosition(directionsEl) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+              if (!isBefore) continue; // After Directions, skip
+              
+              // Get aria-label
+              const ariaLabel = element.getAttribute('aria-label');
+              if (!ariaLabel || !ariaLabel.toLowerCase().includes('stars')) continue;
+              
+              // Parse rating
+              const ratingMatch = ariaLabel.match(/^(\d+(?:[.,]\d+)?)\s*stars?\s*(?:\s|$)/i);
+              if (ratingMatch && ratingMatch[1]) {
+                const numStr = ratingMatch[1].replace(',', '.');
+                const num = parseFloat(numStr);
+                if (!isNaN(num) && num >= 0 && num <= 5) {
+                  const rounded = Math.round(num * 10) / 10;
+                  return { selector: sel, rating: rounded, ariaLabel };
+                }
+              }
+            }
+          }
+          return null;
+        }, [selectors, extractedBusinessName]).catch(() => null) as { selector: string; rating: number; ariaLabel: string } | null;
+        
+        if (result && result.rating !== undefined) {
+          const elapsed = Date.now() - startTime;
+          console.log(`Extracted star rating from aria-label using selector "${result.selector}": ${result.rating} (aria-label: "${result.ariaLabel}") (took ${elapsed}ms)`);
+          return result.rating;
+        }
+      } catch (e) {
+        // Fall through to sequential approach
+      }
+    }
+    
+    // Fallback: Sequential approach (for scoped contexts or when evaluate failed)
     for (const selector of selectors) {
       try {
-        const element = await page.locator(selector).first();
+        const element = searchContext.locator(selector).first();
         
-        // First priority: Extract from aria-label
-        // Format: "4.5 stars " or "4.5 stars" or "Rating: 4.5"
+        // Fast visibility check with timeout
+        const isVisible = await Promise.race([
+          element.isVisible(),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 200))
+        ]).catch(() => false);
+        
+        if (!isVisible) continue;
+        
+        // If Directions button exists, check if this element is before it using fast comparison
+        if (directionsExists) {
+          try {
+            // @ts-ignore - browser context
+            const isBeforeDirections = await page.evaluate((sel) => {
+              // @ts-ignore - browser context
+              const starEl = document.querySelector(sel);
+              // @ts-ignore - browser context
+              const directionsEl = document.querySelector('button[aria-label="Directions"], button[data-value="Directions"]');
+              if (!starEl || !directionsEl) return false;
+              // Use compareDocumentPosition - much faster than querySelectorAll('*')
+              // DOCUMENT_POSITION_FOLLOWING means directionsEl comes after starEl
+              // @ts-ignore - browser context
+              return (starEl.compareDocumentPosition(directionsEl) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+            }, selector).catch(() => false);
+            
+            if (!isBeforeDirections) {
+              // Element is after Directions, skip this selector
+              continue;
+            }
+          } catch (e) {
+            // If comparison fails, continue checking this element
+          }
+        }
+        
+        // Extract from aria-label - must contain "stars" (plural) after the number
         const ariaLabel = await element.getAttribute('aria-label').catch(() => null);
-        if (ariaLabel && (ariaLabel.toLowerCase().includes('star') || ariaLabel.toLowerCase().includes('rating'))) {
-          // Parse from aria-label like "4.5 stars " or "4.5 stars" or "Rating: 4.5"
-          const ratingMatch = ariaLabel.match(/(\d+(?:[.,]\d)?)\s*(?:star|rating)/i);
+        if (ariaLabel && ariaLabel.toLowerCase().includes('stars')) {
+          // Parse from aria-label like "4.5 stars " or "0.0 stars" or "5 stars"
+          // Must match pattern: number followed by "stars" (plural), optionally followed by spaces or end of string
+          const ratingMatch = ariaLabel.match(/^(\d+(?:[.,]\d+)?)\s*stars?\s*(?:\s|$)/i);
           if (ratingMatch && ratingMatch[1]) {
             const numStr = ratingMatch[1].replace(',', '.');
             const num = parseFloat(numStr);
+            // Only accept valid ratings (0.0 to 5.0)
             if (!isNaN(num) && num >= 0 && num <= 5) {
               const rounded = Math.round(num * 10) / 10;
-              console.log(`Extracted star rating from aria-label using selector "${selector}": ${rounded}`);
+              const elapsed = Date.now() - startTime;
+              console.log(`Extracted star rating from aria-label using selector "${selector}": ${rounded} (aria-label: "${ariaLabel}") (took ${elapsed}ms)`);
               return rounded;
             }
           }
@@ -1030,81 +1217,134 @@ export class PlaywrightService {
         // Continue to next selector
       }
     }
-
-    // Try business panel text
-    try {
-      const businessPanel = page.locator('[data-value="Overview"], [role="main"]').first();
-      const panelText = await businessPanel.textContent().catch(() => null);
-      if (panelText) {
-        const pattern = /(\d+(?:[.,]\d)?)\s*stars?/i;
-        const match = panelText.match(pattern);
-        if (match) {
-          const numStr = match[1].replace(',', '.');
-          const num = parseFloat(numStr);
-          if (!isNaN(num) && num >= 0 && num <= 5) {
-            return Math.round(num * 10) / 10;
+    
+    // If we searched in a specific context and didn't find it, try expanding the search
+    // but only within the header section (not whole page) - with timeout optimization
+    if (searchContext !== page && cachedNameElement) {
+      try {
+        // Try grandparent and great-grandparent of name element
+        const grandParent = cachedNameElement.locator('../..').first();
+        const greatGrandParent = cachedNameElement.locator('../../..').first();
+        
+        for (const expandedContext of [grandParent, greatGrandParent]) {
+          for (const selector of selectors) {
+            try {
+              const element = expandedContext.locator(selector).first();
+              
+              // First check if element exists (fast check)
+              const count = await element.count().catch(() => 0);
+              if (count === 0) continue;
+              
+              // If Directions button exists, check if this element is before it
+              if (directionsExists) {
+                try {
+                  // @ts-ignore - browser context
+                  const isBeforeDirections = await page.evaluate((sel) => {
+                    // @ts-ignore - browser context
+                    const starEl = document.querySelector(sel);
+                    // @ts-ignore - browser context
+                    const directionsEl = document.querySelector('button[aria-label="Directions"], button[data-value="Directions"]');
+                    if (!starEl || !directionsEl) return false;
+                    // Use compareDocumentPosition - much faster than querySelectorAll('*')
+                    // DOCUMENT_POSITION_FOLLOWING means directionsEl comes after starEl
+                    // @ts-ignore - browser context
+                    return (starEl.compareDocumentPosition(directionsEl) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+                  }, selector).catch(() => false);
+                  
+                  if (!isBeforeDirections) {
+                    // Element is after Directions, skip
+                    continue;
+                  }
+                } catch (e) {
+                  // If comparison fails, continue
+                }
+              }
+              
+              // Use timeout for visibility check
+              const isVisible = await Promise.race([
+                element.isVisible(),
+                new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300))
+              ]).catch(() => false);
+              
+              if (!isVisible) continue;
+              
+              const ariaLabel = await element.getAttribute('aria-label').catch(() => null);
+              if (ariaLabel && ariaLabel.toLowerCase().includes('stars')) {
+                const ratingMatch = ariaLabel.match(/^(\d+(?:[.,]\d+)?)\s*stars?\s*(?:\s|$)/i);
+                if (ratingMatch && ratingMatch[1]) {
+                  const numStr = ratingMatch[1].replace(',', '.');
+                  const num = parseFloat(numStr);
+                  if (!isNaN(num) && num >= 0 && num <= 5) {
+                    const rounded = Math.round(num * 10) / 10;
+                    const elapsed = Date.now() - startTime;
+                    console.log(`Extracted star rating from expanded context using selector "${selector}": ${rounded} (took ${elapsed}ms)`);
+                    return rounded;
+                  }
+                }
+              }
+            } catch (e) {
+              // Continue
+            }
           }
         }
-      }
-    } catch (e) {
-      // Fallback
-    }
-
-    // Last resort - body text
-    const bodyText = await page.textContent('body').catch(() => '');
-    if (bodyText) {
-      const pattern = /(\d+(?:[.,]\d)?)\s*stars?/i;
-      const match = bodyText.match(pattern);
-      if (match) {
-        const numStr = match[1].replace(',', '.');
-        const num = parseFloat(numStr);
-        if (!isNaN(num) && num >= 0 && num <= 5) {
-          return Math.round(num * 10) / 10;
-        }
+      } catch (e) {
+        // If expansion fails, return null
       }
     }
 
+    // No star rating found before Directions button - return null
+    const elapsed = Date.now() - startTime;
+    console.log(`No star rating found before "Directions" button - returning null (took ${elapsed}ms)`);
     return null;
   }
 
-  async captureScreenshot(url: string, outputPath: string): Promise<boolean> {
+  async captureScreenshot(url: string, outputPath: string, existingPage?: Page | null): Promise<boolean> {
     console.log(`[Screenshot] captureScreenshot called with url: ${url}, outputPath: ${outputPath}`);
-    const context = await this.getContext();
-    const page = await context.newPage();
+    
+    let page: Page | null = null;
+    let shouldClosePage = false;
     
     try {
-      console.log(`[Screenshot] Navigating to URL: ${url}...`);
-      // Use 'domcontentloaded' - same as extractBusinessData, more reliable for Google Maps
-      // Google Maps has continuous network activity, so 'networkidle' or 'load' may timeout
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      console.log(`[Screenshot] Page DOM loaded`);
-      
-      // Wait for page to fully load and business panel to appear
-      console.log(`[Screenshot] Waiting for page to stabilize...`);
-      await page.waitForTimeout(5000); // Increased wait time
-      
-      // Wait for business panel to appear - this is critical
-      console.log(`[Screenshot] Waiting for business panel to appear...`);
-      try {
-        await page.waitForSelector('h1.DUwDvf, h1.lfPIob, [data-value="Overview"], [role="main"]', { 
-          timeout: 20000, // Increased timeout
-          state: 'visible'
-        });
-        console.log('[Screenshot] Business panel detected');
-      } catch (e: any) {
-        console.log(`[Screenshot] Business panel not found with waitForSelector: ${e.message}, continuing...`);
+      if (existingPage) {
+        // Reuse existing page if provided (from extractBusinessData)
+        page = existingPage;
+        console.log(`[Screenshot] Reusing existing page, no navigation needed`);
+      } else {
+        // Create new page if not provided
+        const context = await this.getContext();
+        page = await context.newPage();
+        shouldClosePage = true;
+        
+        console.log(`[Screenshot] Navigating to URL: ${url}...`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        console.log(`[Screenshot] Page DOM loaded`);
+        
+        // Wait for business panel
+        try {
+          await page.waitForSelector('h1.DUwDvf, h1.lfPIob, [data-value="Overview"], [role="main"]', { 
+            timeout: 10000,
+            state: 'visible'
+          });
+          console.log('[Screenshot] Business panel detected');
+        } catch (e: any) {
+          console.log(`[Screenshot] Business panel not found: ${e.message}, continuing...`);
+        }
+        
+        // Reduced wait time
+        await page.waitForTimeout(1500);
       }
-      
-      // Additional wait for dynamic content to fully render
-      await page.waitForTimeout(3000);
       
       // Set viewport to a reasonable size for Google Maps
       // This ensures consistent screenshot dimensions
       await page.setViewportSize({ width: 1280, height: 800 });
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(300); // Reduced wait
       
       // Capture full page screenshot
-      // This will include the left panel (408px wide) plus the map on the right
+      if (!page) {
+        console.error('[Screenshot] No page available for screenshot');
+        return false;
+      }
+      
       console.log(`[Screenshot] Taking full browser window screenshot...`);
       await page.screenshot({ 
         path: outputPath, 
@@ -1127,8 +1367,11 @@ export class PlaywrightService {
       console.error('[Screenshot] Error stack:', e.stack);
       return false;
     } finally {
-      await page.close();
-      console.log(`[Screenshot] Page closed`);
+      // Only close page if we created it
+      if (shouldClosePage && page) {
+        await page.close();
+        console.log(`[Screenshot] Page closed`);
+      }
     }
   }
 
@@ -1143,4 +1386,5 @@ export class PlaywrightService {
     }
   }
 }
+
 

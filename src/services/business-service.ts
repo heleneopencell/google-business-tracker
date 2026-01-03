@@ -1,5 +1,6 @@
 import { Database } from '../db/schema';
 import { PlaywrightService } from './playwright';
+import { SessionService } from './session';
 import { GoogleSheetsService } from './google-sheets';
 import { GoogleDriveService } from './google-drive';
 import { GoogleAuthService } from './google-auth';
@@ -13,6 +14,7 @@ import fs from 'fs';
 export class BusinessService {
   private db: Database;
   private playwright: PlaywrightService;
+  private sessionService: SessionService;
   private sheetsService: GoogleSheetsService;
   private driveService: GoogleDriveService;
   private authService: GoogleAuthService;
@@ -22,10 +24,12 @@ export class BusinessService {
     playwright: PlaywrightService,
     sheetsService: GoogleSheetsService,
     driveService: GoogleDriveService,
-    authService: GoogleAuthService
+    authService: GoogleAuthService,
+    sessionService: SessionService
   ) {
     this.db = db;
     this.playwright = playwright;
+    this.sessionService = sessionService;
     this.sheetsService = sheetsService;
     this.driveService = driveService;
     this.authService = authService;
@@ -78,13 +82,18 @@ export class BusinessService {
     }
 
     // Check if logged in
-    const loggedIn = await this.playwright.checkLoggedIn();
+    const loggedIn = await this.sessionService.checkLoggedIn();
     if (!loggedIn) {
       throw new Error('NOT_LOGGED_IN');
     }
 
-    // Extract initial data
-    const extracted = await this.playwright.extractBusinessData(normalizedUrl);
+    // Extract initial data (returns both extracted data and page for reuse)
+    const { extracted, page: extractionPage } = await this.playwright.extractBusinessData(normalizedUrl);
+    
+    // Close the page after extraction
+    if (extractionPage) {
+      await extractionPage.close().catch(() => {});
+    }
 
     // Insert business first to get the ID
     const result = await this.db.run(
@@ -166,7 +175,7 @@ export class BusinessService {
     console.log(`Running check for business ${businessId} (${business.name || 'Unknown'})...`);
 
     // Check if logged in
-    const loggedIn = await this.playwright.checkLoggedIn();
+    const loggedIn = await this.sessionService.checkLoggedIn();
     if (!loggedIn) {
       throw new Error('NOT_LOGGED_IN');
     }
@@ -183,13 +192,22 @@ export class BusinessService {
       throw new Error('INVALID_URL');
     }
 
-    // Extract data
-    const extracted = await this.playwright.extractBusinessData(url);
-
-    // Get baseline for change detection
-    let baseline: Snapshot | null = null;
-    if (business.spreadsheetId) {
-      baseline = await this.sheetsService.getLastSnapshot(business.spreadsheetId);
+    // Extract data and get baseline in parallel for better performance
+    // This prevents getLastSnapshot from blocking the extraction
+    const [extractionResult, baseline] = await Promise.all([
+      this.playwright.extractBusinessData(url),
+      business.spreadsheetId 
+        ? this.sheetsService.getLastSnapshot(business.spreadsheetId).catch(() => null)
+        : Promise.resolve(null)
+    ]);
+    
+    const { extracted, page: extractionPage } = extractionResult;
+    
+    // Log if page was successfully captured for reuse
+    if (extractionPage) {
+      console.log(`[BusinessService] Extraction page available for screenshot reuse for business ${businessId}`);
+    } else {
+      console.log(`[BusinessService] No extraction page available for business ${businessId}, screenshot will navigate`);
     }
 
     // Ensure business has folderId and spreadsheetId before capturing screenshot
@@ -279,8 +297,14 @@ export class BusinessService {
         console.log(`[Screenshot] Target filename in Drive: ${fileName}`);
         console.log(`[Screenshot] Calling captureScreenshot...`);
         
-        const success = await this.playwright.captureScreenshot(url, screenshotPath);
+        // Reuse the page from extraction if available (saves a full page reload)
+        const success = await this.playwright.captureScreenshot(url, screenshotPath, extractionPage || undefined);
         console.log(`[Screenshot] captureScreenshot returned: ${success}`);
+        
+        // Close the page after screenshot if we have it
+        if (extractionPage) {
+          await extractionPage.close().catch(() => {});
+        }
         
         if (success) {
           // Verify file exists

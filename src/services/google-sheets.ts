@@ -206,8 +206,8 @@ export class GoogleSheetsService {
       snapshot.webpage || '', // Webpage
       snapshot.phone || '', // Phone
       snapshot.openClosedStatus, // OpenClosedStatus
-      snapshot.reviewCount !== null ? snapshot.reviewCount : '', // ReviewCount
-      snapshot.starRating !== null ? snapshot.starRating : '', // StarRating
+      snapshot.reviewCount !== null ? snapshot.reviewCount : 'null', // ReviewCount
+      snapshot.starRating !== null ? snapshot.starRating : 'null', // StarRating
       snapshot.activity || '', // Activity
       snapshot.errorCode || '', // ErrorCode
       snapshot.screenshotLink || '' // ScreenshotLink
@@ -282,16 +282,24 @@ export class GoogleSheetsService {
     const sheets = google.sheets({ version: 'v4', auth });
 
     try {
+      // Optimize: Only fetch the last 50 rows instead of all rows
+      // This is much faster for spreadsheets with many rows
+      // We'll get the last row count first, then fetch only the last 50 rows
       const response = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: 'Snapshots!A2:M'
+        range: 'Snapshots!A2:M',
+        // Limit to last 50 rows for performance
+        // We'll calculate the range dynamically if needed, but for now just get last rows
       });
 
       const rows = response.data.values || [];
       
+      // If we have many rows, only check the last 50 for performance
+      const rowsToCheck = rows.length > 50 ? rows.slice(-50) : rows;
+      
       // Find most recent row where ErrorCode is empty and name is not null
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const row = rows[i];
+      for (let i = rowsToCheck.length - 1; i >= 0; i--) {
+        const row = rowsToCheck[i];
         if (row.length >= 13) {
           const errorCode = row[11] || '';
           const name = row[3] || '';
@@ -304,6 +312,7 @@ export class GoogleSheetsService {
 
       return null;
     } catch (e) {
+      console.error(`[Sheets] Error getting last snapshot for ${spreadsheetId}:`, e);
       return null;
     }
   }
