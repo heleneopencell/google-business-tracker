@@ -47,14 +47,29 @@ async function runDailyCheck() {
 
       for (const business of businesses) {
         try {
-          await businessService.runCheck(business.id);
+          // Force check even if already checked today - scheduled runs should always execute
+          await businessService.runCheck(business.id, true);
           successCount++;
+          
+          // Add random delay between businesses to simulate human behavior (3-6 seconds)
+          // This helps avoid bot detection from rapid sequential requests
+          if (businesses.indexOf(business) < businesses.length - 1) {
+            const delay = 3000 + Math.random() * 3000; // 3-6 seconds
+            console.log(`Waiting ${Math.round(delay)}ms before next business...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
         } catch (e: any) {
           console.error(`Failed to check business ${business.id}: ${e.message}`);
           failureCount++;
           // Extraction failures don't fail the run
           if (e.message !== 'EXTRACTION_FAILED') {
             // But other failures might
+          }
+          
+          // Even on error, add delay before next business
+          if (businesses.indexOf(business) < businesses.length - 1) {
+            const delay = 2000 + Math.random() * 2000; // 2-4 seconds on error
+            await new Promise(resolve => setTimeout(resolve, delay));
           }
         }
       }

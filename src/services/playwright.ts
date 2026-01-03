@@ -88,6 +88,17 @@ export class PlaywrightService {
         logger.performanceWarning('page.goto', navElapsed, CONFIG.PERFORMANCE.PAGE_GOTO_SLOW);
       }
       
+      // Simulate human-like mouse movement to reduce bot detection
+      try {
+        await page.mouse.move(100, 100);
+        await page.waitForTimeout(200 + Math.random() * 300); // 200-500ms random delay
+        await page.mouse.move(200, 200);
+        await page.waitForTimeout(200 + Math.random() * 300);
+        await page.mouse.move(300, 150);
+      } catch (e) {
+        // Ignore mouse movement errors
+      }
+      
       // Wait for business panel to appear - this is critical
       // Google Maps loads the business panel after the main map
       // Use a single wait with reduced timeout
@@ -105,8 +116,8 @@ export class PlaywrightService {
         logger.debug(`Business panel not found after ${waitElapsed}ms, continuing anyway...`);
       }
       
-      // Reduced wait - just enough for dynamic content
-      await page.waitForTimeout(1500);
+      // Random wait to simulate human reading time (1.5-2.5 seconds)
+      await page.waitForTimeout(1500 + Math.random() * 1000);
       
       // Check for interstitials first
       const interstitialError = await this.detectInterstitial(page);
@@ -250,8 +261,10 @@ export class PlaywrightService {
         ])
       ]);
       const parallelExtractionElapsed = Date.now() - parallelExtractionStartTime;
-      logger.performance('Parallel extraction (address, webpage, phone, status, reviews)', parallelExtractionElapsed, CONFIG.PERFORMANCE.PARALLEL_EXTRACTION_SLOW);
-      logger.performanceWarning('Parallel extraction', parallelExtractionElapsed, CONFIG.PERFORMANCE.PARALLEL_EXTRACTION_SLOW);
+      console.log(`[Performance] Parallel extraction (address, webpage, phone, status, reviews) took ${parallelExtractionElapsed}ms`);
+      if (parallelExtractionElapsed > 5000) {
+        console.log(`[Performance] WARNING: Parallel extraction took ${parallelExtractionElapsed}ms - this is very slow!`);
+      }
       
       // Extract star rating - if no reviews, there should be no star rating
       // Pass businessContainer and cached name element
@@ -755,43 +768,51 @@ export class PlaywrightService {
 
   private async extractOpenClosedStatus(page: Page, container?: any): Promise<OpenClosedStatus> {
     // Use container if provided, otherwise search whole page
-    const searchContext = container || page;
-    
-    // First, check for the "Show open hours for the week" indicator (business is active/open)
-    try {
-      const openHoursButton = searchContext.locator('[aria-label*="Show open hours"], [aria-label*="show open hours"]').first();
-      const ariaLabel = await openHoursButton.getAttribute('aria-label').catch(() => null);
-      if (ariaLabel && ariaLabel.toLowerCase().includes('show open hours')) {
-        console.log('Found "Show open hours" indicator - business is OPEN');
-        return 'OPEN';
-      }
-    } catch (e) {
-      // Continue to other checks
-    }
-    
-    // Check body text for closed status
-    const bodyText = (await page.textContent('body').catch(() => '') || '').toLowerCase();
-    
-    // Check for permanently closed
-    if (bodyText.includes('permanently closed')) {
-      console.log('Found "permanently closed" - business is PERMANENTLY_CLOSED');
+    const ctx = container || page;
+
+    // 1) CLOSED banners FIRST (fast + reliable)
+    // Matches the exact element: <span class="aSftqf">Permanently closed</span>
+    const banner = ctx.locator('span.aSftqf').first();
+    const bannerText = (await banner.textContent().catch(() => '') || '').trim().toLowerCase();
+
+    if (bannerText.includes('permanently closed')) {
+      logger.debug('Found "permanently closed" banner - business is PERMANENTLY_CLOSED');
       return 'PERMANENTLY_CLOSED';
     }
-
-    // Check for temporarily closed
-    if (bodyText.includes('temporarily closed')) {
-      console.log('Found "temporarily closed" - business is TEMPORARILY_CLOSED');
+    if (bannerText.includes('temporarily closed')) {
+      logger.debug('Found "temporarily closed" banner - business is TEMPORARILY_CLOSED');
       return 'TEMPORARILY_CLOSED';
     }
-    
-    // Check for open hours text patterns that indicate business is open
-    if (bodyText.includes('open') && (bodyText.includes('hours') || bodyText.includes('closes') || bodyText.includes('opens'))) {
-      console.log('Found open hours information - business is likely OPEN');
+
+    // Fallback: visible text search (handles when class changes)
+    // Add other languages if you need them
+    const closedRegex =
+      /(permanently closed|temporarily closed|définitivement fermé|temporairement fermé|cerrado permanentemente|cerrado temporalmente|dauerhaft geschlossen|vorübergehend geschlossen)/i;
+
+    const closedHit = ctx.getByText(closedRegex, { exact: false }).first();
+    if (await closedHit.isVisible().catch(() => false)) {
+      const t = ((await closedHit.textContent().catch(() => '')) || '').toLowerCase();
+      if (t.includes('permanently') || t.includes('définitivement') || t.includes('permanentemente') || t.includes('dauerhaft')) {
+        logger.debug('Found "permanently closed" via text search - business is PERMANENTLY_CLOSED');
+        return 'PERMANENTLY_CLOSED';
+      }
+      if (t.includes('temporarily') || t.includes('temporairement') || t.includes('temporalmente') || t.includes('vorübergehend')) {
+        logger.debug('Found "temporarily closed" via text search - business is TEMPORARILY_CLOSED');
+        return 'TEMPORARILY_CLOSED';
+      }
+    }
+
+    // 2) Now check for "open hours" / activity signals
+    const openHoursButton = ctx.locator('[aria-label*="Show open hours"], [aria-label*="show open hours"]').first();
+    if (await openHoursButton.isVisible().catch(() => false)) {
+      logger.debug('Found "Show open hours" indicator - business is OPEN');
       return 'OPEN';
     }
 
-    // Check for any activity signal (hours, open now, etc.)
-    if (bodyText.includes('open') || bodyText.includes('hours') || bodyText.includes('closed')) {
+    // Optional: use a narrower text grab from the panel instead of whole body
+    const panelText = (await ctx.textContent().catch(() => '') || '').toLowerCase();
+    if (panelText.includes('opens') || panelText.includes('closes') || panelText.includes('open now')) {
+      logger.debug('Found open hours information in panel text - business is OPEN');
       return 'OPEN';
     }
 
