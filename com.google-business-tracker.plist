@@ -13,9 +13,9 @@
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>16</integer>
+        <integer>7</integer>
         <key>Minute</key>
-        <integer>10</integer>
+        <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/helenesteiner/google business tracker/data/launchd.log</string>

@@ -129,7 +129,7 @@ export class PlaywrightService {
             address: null,
             webpage: null,
             phone: null,
-            openClosedStatus: 'UNKNOWN',
+            openClosedStatus: 'OPEN',
             reviewCount: null,
             starRating: null,
             errorCode: interstitialError
@@ -252,8 +252,11 @@ export class PlaywrightService {
           new Promise<string | null>((resolve) => setTimeout(() => { logger.warn('[Performance] extractPhone timed out after 10s'); resolve(null); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
         ]),
         Promise.race([
-          this.extractOpenClosedStatus(page, businessContainer),
-          new Promise<any>((resolve) => setTimeout(() => { logger.warn('[Performance] extractOpenClosedStatus timed out after 10s'); resolve('UNKNOWN'); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
+          this.extractOpenClosedStatus(page, businessContainer).then((status) => {
+            logger.debug(`extractOpenClosedStatus returned: ${status}`);
+            return status;
+          }),
+          new Promise<any>((resolve) => setTimeout(() => { logger.warn('[Performance] extractOpenClosedStatus timed out after 10s'); resolve('OPEN'); }, CONFIG.TIMEOUTS.EXTRACTION_FUNCTION))
         ]),
         Promise.race([
           this.extractReviewCount(page, businessContainer),
@@ -770,8 +773,12 @@ export class PlaywrightService {
     // Use container if provided, otherwise search whole page
     const ctx = container || page;
 
-    // 1) CLOSED banners FIRST (fast + reliable)
-    // Matches the exact element: <span class="aSftqf">Permanently closed</span>
+    // ============================================
+    // SIMPLIFIED LOGIC: Only check for closed status
+    // If not permanently or temporarily closed, business is OPEN
+    // ============================================
+
+    // STEP 1: Check for "permanently closed" banner
     const banner = ctx.locator('span.aSftqf').first();
     const bannerText = (await banner.textContent().catch(() => '') || '').trim().toLowerCase();
 
@@ -784,8 +791,7 @@ export class PlaywrightService {
       return 'TEMPORARILY_CLOSED';
     }
 
-    // Fallback: visible text search (handles when class changes)
-    // Add other languages if you need them
+    // STEP 2: Check for closed status in visible text (multi-language support)
     const closedRegex =
       /(permanently closed|temporarily closed|définitivement fermé|temporairement fermé|cerrado permanentemente|cerrado temporalmente|dauerhaft geschlossen|vorübergehend geschlossen)/i;
 
@@ -802,21 +808,20 @@ export class PlaywrightService {
       }
     }
 
-    // 2) Now check for "open hours" / activity signals
-    const openHoursButton = ctx.locator('[aria-label*="Show open hours"], [aria-label*="show open hours"]').first();
-    if (await openHoursButton.isVisible().catch(() => false)) {
-      logger.debug('Found "Show open hours" indicator - business is OPEN');
-      return 'OPEN';
-    }
-
-    // Optional: use a narrower text grab from the panel instead of whole body
+    // STEP 3: Check panel text for closed status
     const panelText = (await ctx.textContent().catch(() => '') || '').toLowerCase();
-    if (panelText.includes('opens') || panelText.includes('closes') || panelText.includes('open now')) {
-      logger.debug('Found open hours information in panel text - business is OPEN');
-      return 'OPEN';
+    if (panelText.includes('permanently closed') || panelText.includes('définitivement fermé') || panelText.includes('cerrado permanentemente') || panelText.includes('dauerhaft geschlossen')) {
+      logger.debug('Found "permanently closed" in panel text - business is PERMANENTLY_CLOSED');
+      return 'PERMANENTLY_CLOSED';
+    }
+    if (panelText.includes('temporarily closed') || panelText.includes('temporairement fermé') || panelText.includes('cerrado temporalmente') || panelText.includes('vorübergehend geschlossen')) {
+      logger.debug('Found "temporarily closed" in panel text - business is TEMPORARILY_CLOSED');
+      return 'TEMPORARILY_CLOSED';
     }
 
-    return 'UNKNOWN';
+    // DEFAULT: If not closed, business is OPEN
+    logger.debug('No closed status found - business is OPEN');
+    return 'OPEN';
   }
 
   private async extractReviewCount(page: Page, container?: any): Promise<number | null> {
